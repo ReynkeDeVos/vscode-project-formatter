@@ -3,7 +3,7 @@
   "displayName": "Project Formatter",
   "description": "Use your project's formatter in VS Code. Fall back to Oxfmt.",
   "publisher": "kawa",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MIT",
   "repository": {
     "type": "git",
