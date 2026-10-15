@@ -9,29 +9,13 @@
     "type": "git",
     "url": "https://github.com/ReynkeDeVos/vscode-project-formatter.git"
   },
-  "bugs": {
-    "url": "https://github.com/ReynkeDeVos/vscode-project-formatter/issues"
-  },
+  "bugs": { "url": "https://github.com/ReynkeDeVos/vscode-project-formatter/issues" },
   "homepage": "https://github.com/ReynkeDeVos/vscode-project-formatter#readme",
-  "engines": {
-    "vscode": "^1.93.0"
-  },
-  "categories": [
-    "Formatters"
-  ],
+  "engines": { "vscode": "^1.93.0" },
+  "categories": ["Formatters"],
   "main": "./extension.cjs",
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "capabilities": {
-    "untrustedWorkspaces": {
-      "supported": false
-    }
-  },
-  "scripts": {
-    "test": "node --test formatter.test.cjs"
-  },
-  "dependencies": {
-    "yaml": "2.9.1"
-  }
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "scripts": { "test": "node --test formatter.test.cjs" },
+  "dependencies": { "yaml": "2.9.1" }
 }
