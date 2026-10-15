@@ -3,7 +3,6 @@ const path = require('node:path');
 const os = require('node:os');
 const { execFile, fork } = require('node:child_process');
 const { promisify } = require('node:util');
-const { parse: parseYaml } = require('yaml');
 
 // Each formatter's npm package and the arguments that format stdin as a named file. Order is dependency precedence.
 const tools = {
@@ -56,10 +55,6 @@ function declared(dir, pkg) {
     if (config) return { tool, reason: config };
   }
   if (pkg.prettier) return { tool: 'prettier', reason: 'package.json: prettier' };
-  let yamlPkg;
-  try { yamlPkg = parseYaml(readIfExists(path.join(dir, 'package.yaml'))); }
-  catch { /* Prettier skips invalid package.yaml files when searching for a config. */ }
-  if (yamlPkg?.prettier) return { tool: 'prettier', reason: 'package.yaml: prettier' };
   const config = prettierConfigs.find(name => fs.existsSync(path.join(dir, name)));
   if (config) return { tool: 'prettier', reason: config };
   const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
