@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { format, oxcPath } = require('./formatter.cjs');
+const { format, oxcPath, stopPrettier } = require('./formatter.cjs');
 
 exports.activate = context => {
   const output = vscode.window.createOutputChannel('Project Formatter');
@@ -7,7 +7,7 @@ exports.activate = context => {
     'javascript', 'javascriptreact', 'typescript', 'typescriptreact', 'html', 'css', 'scss', 'less',
     'json', 'jsonc', 'json5', 'yaml', 'toml', 'markdown', 'mdx', 'graphql', 'handlebars', 'mjml', 'vue', 'svelte',
   ];
-  context.subscriptions.push(output, vscode.languages.registerDocumentFormattingEditProvider(
+  context.subscriptions.push(output, { dispose: stopPrettier }, vscode.languages.registerDocumentFormattingEditProvider(
     languages.map(language => ({ language, scheme: 'file' })),
     {
       async provideDocumentFormattingEdits(document, options, token) {
