@@ -3,7 +3,7 @@
   "displayName": "Project Formatter",
   "description": "Use your project's formatter in VS Code. Fall back to Oxfmt.",
   "publisher": "kawa",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,5 +16,6 @@
   "main": "./extension.cjs",
   "activationEvents": ["onStartupFinished"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
-  "scripts": { "test": "node --test formatter.test.cjs" }
+  "scripts": { "test": "node --test formatter.test.cjs" },
+  "dependencies": { "yaml": "2.9.1" }
 }

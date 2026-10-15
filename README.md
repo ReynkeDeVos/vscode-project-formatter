@@ -10,4 +10,4 @@ Detects nearby configs, `format`/`fmt` scripts and dependencies. Uses local bina
 
 Linux/macOS; saved files only. Custom script wrappers/flags aren't interpreted. Bun needs native `bun fmt` and no overriding `fmt` script.
 
-Test: `npm test`. Package: `npx @vscode/vsce package --no-dependencies`.
+Test: `npm ci && npm test`. Package: `npx @vscode/vsce package`.

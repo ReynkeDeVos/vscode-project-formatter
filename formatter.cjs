@@ -3,11 +3,13 @@ const path = require('node:path');
 const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
+const { parse: parseYaml } = require('yaml');
 
 const prettierConfigs = [
   '.prettierrc',
-  ...['json', 'json5', 'yml', 'yaml', 'toml', 'js', 'mjs', 'cjs', 'ts', 'mts', 'cts'].map(ext => `.prettierrc.${ext}`),
-  ...['js', 'mjs', 'cjs', 'ts', 'mts', 'cts'].map(ext => `prettier.config.${ext}`),
+  ...['json', 'yml', 'yaml', 'json5'].map(ext => `.prettierrc.${ext}`),
+  ...['js', 'ts', 'mjs', 'mts', 'cjs', 'cts'].flatMap(ext => [`.prettierrc.${ext}`, `prettier.config.${ext}`]),
+  '.prettierrc.toml',
 ];
 const oxfmtConfigs = [
   '.oxfmtrc.json', '.oxfmtrc.jsonc',
@@ -45,12 +47,19 @@ function detect(file, workspace) {
     const bunfig = read(path.join(dir, 'bunfig.toml'));
     if (/^\s*\[\[?fmt(?:\.|\])/m.test(bunfig)) return { tool: 'bun', cwd: dir, reason: 'bunfig.toml: fmt' };
     for (const [tool, names] of [
-      ['oxfmt', oxfmtConfigs], ['biome', ['biome.json', 'biome.jsonc']], ['prettier', prettierConfigs],
+      ['oxfmt', oxfmtConfigs], ['biome', ['biome.json', 'biome.jsonc']],
     ]) {
       const config = names.find(name => fs.existsSync(path.join(dir, name)));
       if (config) return { tool, cwd: dir, reason: config };
     }
-    if (pkg.prettier !== undefined) return { tool: 'prettier', cwd: dir, reason: 'package.json: prettier' };
+    if (pkg.prettier) return { tool: 'prettier', cwd: dir, reason: 'package.json: prettier' };
+    const yamlSource = read(path.join(dir, 'package.yaml'));
+    let yamlPkg;
+    try { yamlPkg = parseYaml(yamlSource); }
+    catch { /* Prettier skips invalid package.yaml files when searching for a config. */ }
+    if (yamlPkg?.prettier) return { tool: 'prettier', cwd: dir, reason: 'package.yaml: prettier' };
+    const config = prettierConfigs.find(name => fs.existsSync(path.join(dir, name)));
+    if (config) return { tool: 'prettier', cwd: dir, reason: config };
     const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
     const tool = ['oxfmt', '@biomejs/biome', 'prettier'].find(name => dependencies[name]);
     if (tool) return { tool: tool === '@biomejs/biome' ? 'biome' : tool, cwd: dir, reason: `dependency: ${tool}` };
