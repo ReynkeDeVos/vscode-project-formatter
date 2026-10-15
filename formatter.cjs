@@ -5,6 +5,13 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { parse: parseYaml } = require('yaml');
 
+// Each formatter's npm package and the arguments that format stdin as a named file. Order is dependency precedence.
+const tools = {
+  oxfmt: { pkg: 'oxfmt', args: ['--stdin-filepath'] },
+  biome: { pkg: '@biomejs/biome', args: ['format', '--stdin-file-path'] },
+  prettier: { pkg: 'prettier', args: ['--stdin-filepath'] },
+  bun: { args: ['fmt', '--stdin-filepath'] },
+};
 const prettierConfigs = [
   '.prettierrc',
   ...['json', 'yml', 'yaml', 'json5'].map(ext => `.prettierrc.${ext}`),
@@ -16,83 +23,92 @@ const oxfmtConfigs = [
   ...['js', 'mjs', 'cjs', 'ts', 'mts', 'cts'].map(ext => `oxfmt.config.${ext}`),
 ];
 
-function directories(file, workspace) {
+// The file's folder and its parents, up to the repository root or home.
+function projectDirs(file) {
   const result = [];
   for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
     result.push(dir);
-    if (dir === workspace || dir === os.homedir() || dir === path.dirname(dir) || fs.existsSync(path.join(dir, '.git'))) break;
+    if (dir === os.homedir() || dir === path.dirname(dir) || fs.existsSync(path.join(dir, '.git'))) break;
   }
   return result;
 }
 
-function read(file) {
+function readIfExists(file) {
   try { return fs.readFileSync(file, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return ''; throw error; }
 }
 
-function detect(file, workspace) {
-  const dirs = directories(file, workspace);
-  const fallback = dirs.find(dir => fs.existsSync(path.join(dir, 'package.json'))) || dirs.at(-1);
+// The formatter one folder declares: script, bunfig, Oxfmt config, Biome config, Prettier config, then dependency.
+function declared(dir, pkg) {
+  // shortcut: recognize standard formatter commands; custom wrappers need an explicit VSCode formatter override.
+  for (const [name, command] of Object.entries(pkg.scripts || {})) {
+    if (!/^(?:format|fmt)(?::.*)?$/.test(name) || typeof command !== 'string') continue;
+    const match = command.match(/(?:^|[\s;&|])(?:(bun)\s+fmt\b|(prettier|oxfmt|biome)\b)/);
+    if (match) return { tool: match[1] || match[2], reason: `package.json: ${name}` };
+  }
+  if (/^\s*\[\[?fmt(?:\.|\])/m.test(readIfExists(path.join(dir, 'bunfig.toml')))) return { tool: 'bun', reason: 'bunfig.toml: fmt' };
+  for (const [tool, names] of [
+    ['oxfmt', oxfmtConfigs], ['biome', ['biome.json', 'biome.jsonc']],
+  ]) {
+    const config = names.find(name => fs.existsSync(path.join(dir, name)));
+    if (config) return { tool, reason: config };
+  }
+  if (pkg.prettier) return { tool: 'prettier', reason: 'package.json: prettier' };
+  let yamlPkg;
+  try { yamlPkg = parseYaml(readIfExists(path.join(dir, 'package.yaml'))); }
+  catch { /* Prettier skips invalid package.yaml files when searching for a config. */ }
+  if (yamlPkg?.prettier) return { tool: 'prettier', reason: 'package.yaml: prettier' };
+  const config = prettierConfigs.find(name => fs.existsSync(path.join(dir, name)));
+  if (config) return { tool: 'prettier', reason: config };
+  const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
+  const tool = Object.keys(tools).find(name => tools[name].pkg && dependencies[tools[name].pkg]);
+  if (tool) return { tool, reason: `dependency: ${tools[tool].pkg}` };
+}
+
+function detect(file) {
+  const dirs = projectDirs(file);
   for (const dir of dirs) {
     // Home contains personal Oxfmt defaults, not a project formatter declaration.
     if (dir === os.homedir()) break;
-    const source = read(path.join(dir, 'package.json'));
+    const source = readIfExists(path.join(dir, 'package.json'));
     const pkg = source ? JSON.parse(source) : {};
-    // shortcut: recognize standard formatter commands; custom wrappers need an explicit VSCode formatter override.
-    for (const [name, command] of Object.entries(pkg.scripts || {})) {
-      if (!/^(?:format|fmt)(?::.*)?$/.test(name) || typeof command !== 'string') continue;
-      const match = command.match(/(?:^|[\s;&|])(?:(bun)\s+fmt\b|(prettier|oxfmt|biome)\b)/);
-      if (match) return { tool: match[1] || match[2], cwd: dir, reason: `package.json: ${name}` };
-    }
-    const bunfig = read(path.join(dir, 'bunfig.toml'));
-    if (/^\s*\[\[?fmt(?:\.|\])/m.test(bunfig)) return { tool: 'bun', cwd: dir, reason: 'bunfig.toml: fmt' };
-    for (const [tool, names] of [
-      ['oxfmt', oxfmtConfigs], ['biome', ['biome.json', 'biome.jsonc']],
-    ]) {
-      const config = names.find(name => fs.existsSync(path.join(dir, name)));
-      if (config) return { tool, cwd: dir, reason: config };
-    }
-    if (pkg.prettier) return { tool: 'prettier', cwd: dir, reason: 'package.json: prettier' };
-    const yamlSource = read(path.join(dir, 'package.yaml'));
-    let yamlPkg;
-    try { yamlPkg = parseYaml(yamlSource); }
-    catch { /* Prettier skips invalid package.yaml files when searching for a config. */ }
-    if (yamlPkg?.prettier) return { tool: 'prettier', cwd: dir, reason: 'package.yaml: prettier' };
-    const config = prettierConfigs.find(name => fs.existsSync(path.join(dir, name)));
-    if (config) return { tool: 'prettier', cwd: dir, reason: config };
-    const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
-    const tool = ['oxfmt', '@biomejs/biome', 'prettier'].find(name => dependencies[name]);
-    if (tool) return { tool: tool === '@biomejs/biome' ? 'biome' : tool, cwd: dir, reason: `dependency: ${tool}` };
+    const found = declared(dir, pkg);
+    if (!found) continue;
+    // shortcut: Bun dispatches a fmt package script before its formatter; refuse it until Bun exposes a direct native invocation.
+    if (found.tool === 'bun' && pkg.scripts?.fmt) throw new Error('A package.json fmt script overrides bun fmt; configure this project formatter explicitly.');
+    return { ...found, cwd: dir };
   }
+  const fallback = dirs.find(dir => fs.existsSync(path.join(dir, 'package.json'))) || dirs.at(-1);
   return { tool: 'oxfmt', cwd: fallback, reason: 'Oxfmt fallback' };
 }
 
-function invocation(file, workspace, oxfmtPath) {
-  const selection = detect(file, workspace);
-  const local = directories(file).map(dir => path.join(dir, 'node_modules', '.bin', selection.tool))
-    .find(candidate => fs.existsSync(candidate));
-  const executable = local || (selection.tool === 'oxfmt' && oxfmtPath) || selection.tool;
-  const args = selection.tool === 'bun' ? ['fmt'] : selection.tool === 'biome' ? ['format'] : [];
-  args.push('--stdin-filepath', file);
-  if (selection.tool === 'prettier') {
-    const ignoreDir = directories(file).find(dir => fs.existsSync(path.join(dir, '.prettierignore')));
-    if (ignoreDir) args.push('--ignore-path', path.join(ignoreDir, '.prettierignore'));
-  }
-  return { ...selection, executable, args };
+// Resolve an oxc.path.* setting like the Oxc extension: ${userHome}, ${env:NAME}, relative to the first workspace folder.
+function oxcPath(value, root) {
+  if (typeof value !== 'string') return undefined;
+  const resolved = value.replaceAll(/\$\{(userHome|env:([^}]+))\}/g, (_, variable, name) => name ? process.env[name] ?? '' : os.homedir());
+  return resolved && (path.isAbsolute(resolved) ? path.normalize(resolved) : root && path.join(root, resolved));
 }
 
-async function format(input, file, workspace, oxfmtPath, nodePath, signal, log = () => {}) {
-  const command = invocation(file, workspace, oxfmtPath);
+function invocation(file, oxfmtPath) {
+  const selection = detect(file);
+  const local = projectDirs(file).map(dir => path.join(dir, 'node_modules', '.bin', selection.tool))
+    .find(candidate => fs.existsSync(candidate));
+  // An explicit oxc.path.oxfmt beats node_modules, as in the Oxc extension.
+  const executable = (selection.tool === 'oxfmt' && oxfmtPath) || local || selection.tool;
+  return { ...selection, executable, args: [...tools[selection.tool].args, file] };
+}
+
+async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) {
+  const command = invocation(file, oxfmtPath);
   log(`${file}: ${command.tool} (${command.reason})`);
   const env = { ...process.env, PATH: [
-    nodePath && path.dirname(nodePath), path.join(os.homedir(), '.local/share/mise/shims'), process.env.PATH,
+    nodePath && path.dirname(nodePath), process.env.PATH,
+    // shortcut: only mise shims are added for editors started without the shell PATH; add other version managers when asked.
+    path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims'),
   ].filter(Boolean).join(path.delimiter) };
   if (command.tool === 'bun') {
     const { stdout } = await promisify(execFile)(command.executable, ['--help'], { cwd: command.cwd, env, encoding: 'utf8', timeout: 5000, signal });
     if (!/^\s+fmt\s/m.test(stdout)) throw new Error('This Bun installation does not include bun fmt. File kept unchanged.');
-    const source = read(path.join(command.cwd, 'package.json'));
-    // shortcut: Bun dispatches a fmt package script before its formatter; refuse it until Bun exposes a direct native invocation.
-    if (source && JSON.parse(source).scripts?.fmt) throw new Error('A package.json fmt script overrides bun fmt; configure this project formatter explicitly.');
   }
   return new Promise((resolve, reject) => {
     const child = execFile(command.executable, command.args, {
@@ -108,4 +124,4 @@ async function format(input, file, workspace, oxfmtPath, nodePath, signal, log =
   });
 }
 
-module.exports = { detect, invocation, format };
+module.exports = { detect, invocation, format, oxcPath };

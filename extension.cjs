@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { format } = require('./formatter.cjs');
+const { format, oxcPath } = require('./formatter.cjs');
 
 exports.activate = context => {
   const output = vscode.window.createOutputChannel('Project Formatter');
@@ -17,9 +17,9 @@ exports.activate = context => {
         try {
           const input = document.getText();
           const oxc = vscode.workspace.getConfiguration('oxc', document.uri);
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
           const formatted = await format(input, document.fileName,
-            vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath,
-            oxc.get('path.oxfmt'), oxc.get('path.node'), abort.signal,
+            oxcPath(oxc.get('path.oxfmt'), root), oxcPath(oxc.get('path.node'), root), abort.signal,
             message => output.appendLine(message));
           if (token.isCancellationRequested || formatted === input) return [];
           return [vscode.TextEdit.replace(new vscode.Range(document.positionAt(0), document.positionAt(input.length)), formatted)];
