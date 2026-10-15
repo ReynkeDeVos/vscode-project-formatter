@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { detect, invocation, format, oxcPath } = require('./formatter.cjs');
+const { detect, invocation, format, oxcPath, stopPrettier } = require('./formatter.cjs');
 
 // A throwaway repository root, so detection stops there instead of walking into the real temp directory.
 function repo(t, prefix) {
@@ -100,9 +100,17 @@ test('project detection, nested configs, explicit commands, fallback and safe ex
   write('biome.jsonc');
   assert.equal(detect(file).tool, 'biome');
   fs.unlinkSync(path.join(root, 'biome.jsonc'));
+  write('.dprint.jsonc');
+  assert.equal(detect(file).tool, 'dprint');
+  fs.unlinkSync(path.join(root, '.dprint.jsonc'));
+  write('package.json', JSON.stringify({ scripts: { 'fmt:check': 'dprint check' } }));
+  assert.equal(detect(file).tool, 'dprint');
+  write('package.json');
   fs.unlinkSync(path.join(root, '.prettierrc'));
   write('package.json', JSON.stringify({ devDependencies: { prettier: '^3' } }));
   assert.equal(detect(file).tool, 'prettier');
+  write('package.json', JSON.stringify({ devDependencies: { prettier: '^3', dprint: '^0.50' } }));
+  assert.equal(detect(file).tool, 'dprint');
   write('package.json', JSON.stringify({ prettier: {} }));
   assert.equal(detect(file).tool, 'prettier');
   write('package.json', '{broken');
@@ -133,7 +141,7 @@ test('project detection, nested configs, explicit commands, fallback and safe ex
   await assert.rejects(format('const a=1;', file), /script overrides bun fmt/);
 });
 
-test('monorepo packages, Biome arguments and oxc.path settings', t => {
+test('monorepo packages, Biome and dprint programs, and oxc.path settings', t => {
   const root = repo(t, 'project-formatter-monorepo-');
   const app = path.join(root, 'packages', 'app');
   const file = path.join(app, 'src', 'a.ts');
@@ -143,9 +151,29 @@ test('monorepo packages, Biome arguments and oxc.path settings', t => {
   assert.deepEqual(detect(file), { tool: 'prettier', reason: '.prettierrc', cwd: root });
   fs.writeFileSync(path.join(app, 'biome.json'), '{}');
   assert.deepEqual(invocation(file).args, ['format', '--stdin-file-path', file]);
-  fs.renameSync(path.join(app, 'biome.json'), path.join(app, '.oxfmtrc.json'));
-  const bin = path.join(root, 'node_modules', '.bin');
+  // Biome and dprint skip their Node launcher once their native program is installed.
+  const modules = path.join(root, 'node_modules');
+  const bin = path.join(modules, '.bin');
+  const exe = process.platform === 'win32' ? '.exe' : '';
   fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'biome'), '');
+  assert.equal(invocation(file).executable, path.join(bin, 'biome'));
+  const store = path.join(modules, '.pnpm', 'node_modules', '@biomejs'); // pnpm links @biomejs/biome next to its platform package.
+  const biome = path.join(store, `cli-${process.platform}-${process.arch}-musl`, `biome${exe}`);
+  fs.mkdirSync(path.dirname(biome), { recursive: true });
+  fs.mkdirSync(path.join(store, 'biome'));
+  fs.mkdirSync(path.join(modules, '@biomejs'));
+  fs.symlinkSync(path.join(store, 'biome'), path.join(modules, '@biomejs', 'biome'), 'junction');
+  fs.writeFileSync(biome, '');
+  assert.equal(invocation(file).executable, fs.realpathSync(biome));
+  fs.renameSync(path.join(app, 'biome.json'), path.join(app, 'dprint.json'));
+  assert.deepEqual(invocation(file).args, ['fmt', '--stdin', file]);
+  fs.writeFileSync(path.join(bin, 'dprint'), '');
+  assert.equal(invocation(file).executable, path.join(bin, 'dprint'));
+  fs.mkdirSync(path.join(modules, 'dprint'));
+  fs.writeFileSync(path.join(modules, 'dprint', `dprint${exe}`), '');
+  assert.equal(invocation(file).executable, path.join(modules, 'dprint', `dprint${exe}`));
+  fs.renameSync(path.join(app, 'dprint.json'), path.join(app, '.oxfmtrc.json'));
   fs.writeFileSync(path.join(bin, 'oxfmt'), '');
   assert.equal(invocation(file).executable, path.join(bin, 'oxfmt'));
   assert.equal(invocation(file, '/opt/oxfmt').executable, '/opt/oxfmt');
@@ -156,4 +184,50 @@ test('monorepo packages, Biome arguments and oxc.path settings', t => {
   assert.equal(oxcPath('bin/oxfmt', root), path.join(root, 'bin', 'oxfmt'));
   assert.equal(oxcPath('${workspaceFolder}/oxfmt', root), path.join(root, '${workspaceFolder}', 'oxfmt'));
   for (const unset of [undefined, '', '${env:PROJECT_FORMATTER_UNSET}', 'bin/oxfmt']) assert.ok(!oxcPath(unset), unset);
+});
+
+test('Prettier 3 stays loaded per project, restarts when its config changes and exits when unused', async t => {
+  const root = repo(t, 'prettier-process-');
+  t.after(stopPrettier);
+  const file = path.join(root, 'a.ts');
+  const modules = path.join(root, 'node_modules');
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.mkdirSync(path.join(modules, 'prettier'));
+  fs.writeFileSync(path.join(modules, '.bin', 'prettier'), '');
+  // A stand-in for Prettier's API; require caches the config, so only a fresh process sees an edit.
+  fs.writeFileSync(path.join(modules, 'prettier', 'index.cjs'), `
+    exports.getFileInfo = async (file, { ignorePath }) => ({ ignored: ignorePath.includes('.prettierignore') && file.endsWith('ignored.ts') });
+    exports.resolveConfig = async () => require(process.cwd() + '/.prettierrc.cjs');
+    exports.format = async (text, options) => {
+      if (text === 'broken') throw new Error('syntax error');
+      return text === 'empty' ? '' : options.prefix + process.pid;
+    };
+  `);
+  const config = path.join(root, '.prettierrc.cjs');
+  fs.writeFileSync(config, 'module.exports = { prefix: "a" };');
+  assert.equal(invocation(file).prettier, path.join(modules, 'prettier', 'index.cjs'));
+  const first = await format('x', file);
+  assert.match(first, /^a\d+$/);
+  assert.equal(await format('y', file), first);
+  assert.equal(await format('keep', path.join(root, 'ignored.ts')), 'keep');
+  await assert.rejects(format('broken', file), /prettier: syntax error/);
+  await assert.rejects(format('empty', file), /empty output/);
+  const abort = new AbortController();
+  abort.abort();
+  await assert.rejects(format('x', file, undefined, undefined, abort.signal), /aborted/);
+  fs.writeFileSync(config, 'module.exports = { prefix: "b" };');
+  fs.utimesSync(config, new Date(), new Date(Date.now() + 1000));
+  const second = await format('x', file);
+  assert.match(second, /^b\d+$/);
+  assert.notEqual(second.slice(1), first.slice(1));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  assert.equal(await format('x', file), second);
+  t.mock.timers.tick(15 * 60 * 1000);
+  const third = await format('x', file);
+  assert.match(third, /^b\d+$/);
+  assert.notEqual(third, second);
+  const alive = pid => { try { return process.kill(pid, 0); } catch { return false; } };
+  while (alive(Number(second.slice(1)))) await new Promise(setImmediate);
+  fs.rmSync(path.join(modules, 'prettier', 'index.cjs'));
+  assert.equal(invocation(file).prettier, undefined);
 });
