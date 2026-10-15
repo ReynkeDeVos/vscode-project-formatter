@@ -3,19 +3,35 @@
   "displayName": "Project Formatter",
   "description": "Use your project's formatter in VS Code. Fall back to Oxfmt.",
   "publisher": "kawa",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/ReynkeDeVos/vscode-project-formatter.git"
   },
-  "bugs": { "url": "https://github.com/ReynkeDeVos/vscode-project-formatter/issues" },
+  "bugs": {
+    "url": "https://github.com/ReynkeDeVos/vscode-project-formatter/issues"
+  },
   "homepage": "https://github.com/ReynkeDeVos/vscode-project-formatter#readme",
-  "engines": { "vscode": "^1.93.0" },
-  "categories": ["Formatters"],
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Formatters"
+  ],
   "main": "./extension.cjs",
-  "activationEvents": ["onStartupFinished"],
-  "capabilities": { "untrustedWorkspaces": { "supported": false } },
-  "scripts": { "test": "node --test formatter.test.cjs" },
-  "dependencies": { "yaml": "2.9.1" }
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "scripts": {
+    "test": "node --test formatter.test.cjs"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
 }
