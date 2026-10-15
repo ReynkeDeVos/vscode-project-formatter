@@ -3,6 +3,3 @@
 .vscodeignore
 *.test.cjs
 *.vsix
-node_modules/yaml/browser/**
-node_modules/yaml/**/*.d.ts
-node_modules/yaml/bin.mjs

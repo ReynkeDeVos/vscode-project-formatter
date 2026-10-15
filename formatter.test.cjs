@@ -18,7 +18,6 @@ test('detect every documented Prettier config in its documented precedence', t =
   const file = path.join(root, 'example.ts');
   const configs = [
     ['package.json', '{"prettier": {"singleQuote": true}}'],
-    ['package.yaml', 'prettier:\n  singleQuote: true\n'],
     ['.prettierrc', 'singleQuote: true\n'],
     ['.prettierrc.json', '{"singleQuote": true}'],
     ['.prettierrc.yml', 'singleQuote: true\n'],
@@ -50,31 +49,6 @@ test('detect every documented Prettier config in its documented precedence', t =
     fs.unlinkSync(path.join(root, name));
   }
   assert.equal(detect(file).tool, 'oxfmt');
-});
-
-test('package.yaml requires a top-level Prettier config, including quoted keys and aliases', t => {
-  const root = repo(t, 'prettier-package-yaml-');
-  const file = path.join(root, 'example.ts');
-  for (const content of [
-    '---\nprettier:\n  singleQuote: true\n',
-    '"prettier": {singleQuote: true}\n',
-    '{prettier: {singleQuote: true}}',
-    'defaults: &options {singleQuote: true}\nprettier: *options\n',
-    '? prettier\n: {singleQuote: true}\n',
-  ]) {
-    fs.writeFileSync(path.join(root, 'package.yaml'), content);
-    assert.equal(detect(file).reason, 'package.yaml: prettier', content);
-  }
-  for (const content of [
-    '', 'name: example\n', '# prettier: {}\n', 'scripts:\n  prettier: format\n',
-    'description: |\n  prettier: {}\n', 'prettier: null\n', 'prettier: false\n', 'prettier: [broken',
-  ]) {
-    fs.writeFileSync(path.join(root, 'package.yaml'), content);
-    assert.equal(detect(file).tool, 'oxfmt', content);
-    fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
-    assert.equal(detect(file).reason, '.prettierrc', content);
-    fs.unlinkSync(path.join(root, '.prettierrc'));
-  }
 });
 
 test('project detection, nested configs, explicit commands, fallback and safe execution', async t => {

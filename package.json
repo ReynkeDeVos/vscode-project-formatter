@@ -16,6 +16,5 @@
   "main": "./extension.cjs",
   "activationEvents": ["onStartupFinished"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
-  "scripts": { "test": "node --test formatter.test.cjs" },
-  "dependencies": { "yaml": "2.9.1" }
+  "scripts": { "test": "node --test formatter.test.cjs" }
 }
