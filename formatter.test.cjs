@@ -241,6 +241,17 @@ test('Oxfmt takes file types Prettier cannot parse and skips names it does not k
   assert.equal(await format('a=1\n', file, oxfmt), 'from oxfmt\n');
   script('node_modules/.bin/prettier', 'console.error("[error] a.js: SyntaxError: Unexpected token (1:1)\\n[error] > 1 | No parser could be inferred for file \\"x\\""); process.exitCode = 2;');
   await assert.rejects(format('a=1\n', file, oxfmt), /prettier: .*SyntaxError/);
+  // A file name can hold a newline followed by the same words.
+  for (const error of [
+    '[error] /p/a\\n[error] No parser could be inferred for file x.js: SyntaxError: Unexpected token (1:1)',
+    '[error] /p/a\\n[error] No parser could be inferred for file \\"x\\".\\n[error] b.js: SyntaxError: Unexpected token (1:1)',
+  ]) {
+    script('node_modules/.bin/prettier', `console.error('${error}'); process.exitCode = 2;`);
+    await assert.rejects(format('a=1\n', file, oxfmt), /prettier: .*\/p\/a/);
+  }
+  // Prettier 2 words it differently.
+  script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file: /p/a.toml"); process.exitCode = 2;');
+  assert.equal(await format('a=1\n', file, oxfmt), 'from oxfmt\n');
 });
 
 test('the kept-loaded Prettier also hands file types it cannot parse to Oxfmt', async t => {

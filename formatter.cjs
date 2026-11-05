@@ -224,8 +224,8 @@ async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) 
   } catch (error) {
     // The project's formatter decides only for file types it can parse; the rest, like TOML under Prettier, go to Oxfmt.
     // shortcut: only Prettier's message is recognized; add Biome's and dprint's when a project needs them.
-    // A whole line, because syntax errors quote the source and that could contain the same words.
-    if (command.tool !== 'prettier' || !/^(?:prettier: )?(?:\[error\] )?No parser could be inferred for file /m.test(error.message)) throw error;
+    // The whole message after any warnings, because syntax errors quote the source and file name, which can contain these words.
+    if (!/^prettier: (?:\[warn\] .*\n)*(?:\[error\] )?No parser could be inferred for file:? .*$/.test(error.message)) throw error;
     const fallback = { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' };
     return run(invocation(file, oxfmtPath, fallback), input, file, nodePath, signal, log);
   }
