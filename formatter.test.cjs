@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { detect, invocation, format, oxcPath, stopPrettier } = require('./formatter.cjs');
+const { detect, documentPath, invocation, format, oxcPath, stopPrettier } = require('./formatter.cjs');
 
 // A throwaway repository root, so detection stops there instead of walking into the real temp directory.
 function repo(t, prefix) {
@@ -204,4 +204,75 @@ test('Prettier 3 stays loaded per project, restarts when its config changes and 
   while (alive(Number(second.slice(1)))) await new Promise(setImmediate);
   fs.rmSync(path.join(modules, 'prettier', 'index.cjs'));
   assert.equal(invocation(file).prettier, undefined);
+});
+
+test('documents without a file of their own keep their location and name their syntax', () => {
+  const doc = (scheme, fileName, languageId) => ({ uri: { scheme }, fileName, languageId });
+  assert.equal(documentPath(doc('file', '/p/tsconfig.json', 'jsonc'), '/root'), '/p/tsconfig.json');
+  assert.equal(documentPath(doc('vscode-userdata', '/u/settings.json', 'jsonc'), '/root'), '/u/settings.json.jsonc');
+  assert.equal(documentPath(doc('vscode-userdata', '/u/mcp.jsonc', 'jsonc'), '/root'), '/u/mcp.jsonc');
+  assert.equal(documentPath(doc('untitled', 'Untitled-1', 'typescript'), '/root'), '/root/Untitled-1.ts');
+  assert.equal(documentPath(doc('untitled', 'Untitled-1', 'markdown'), undefined), path.join(os.homedir(), 'Untitled-1.md'));
+  assert.equal(documentPath(doc('vscode-notebook-cell', '/p/a.ipynb', 'markdown'), '/root'), '/p/a.ipynb.md');
+});
+
+test('Oxfmt takes file types Prettier cannot parse and skips names it does not know', async t => {
+  const root = repo(t, 'project-formatter-fallback-');
+  const script = (name, body) => {
+    const file = path.join(root, name);
+    fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+    return file;
+  };
+  fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
+  fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
+  script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file \\"a.toml\\"."); process.exitCode = 2;');
+  const oxfmt = script('oxfmt', 'console.log("from oxfmt");');
+  const file = path.join(root, 'a.toml');
+  const log = [];
+  assert.equal(await format('a=1\n', file, oxfmt, undefined, undefined, message => log.push(message)), 'from oxfmt\n');
+  assert.ok(log.some(message => message.includes('oxfmt (Prettier has no parser for this file)')));
+  script('oxfmt', 'console.error("Unsupported file type for stdin-filepath"); process.exitCode = 1;');
+  assert.equal(await format('a=1\n', file, oxfmt), 'a=1\n');
+  // Syntax errors quote the source, which can contain the same words as the diagnostics above.
+  script('oxfmt', 'console.error("  x Unexpected token\\n 1 | Unsupported file type for stdin-filepath"); process.exitCode = 2;');
+  await assert.rejects(format('a=1\n', file, oxfmt), /Unexpected token/);
+  script('oxfmt', 'console.log("from oxfmt");');
+  script('node_modules/.bin/prettier', 'console.error("[warn] Ignored unknown option\\n[error] No parser could be inferred for file \\"a.toml\\"."); process.exitCode = 2;');
+  assert.equal(await format('a=1\n', file, oxfmt), 'from oxfmt\n');
+  script('node_modules/.bin/prettier', 'console.error("[error] a.js: SyntaxError: Unexpected token (1:1)\\n[error] > 1 | No parser could be inferred for file \\"x\\""); process.exitCode = 2;');
+  await assert.rejects(format('a=1\n', file, oxfmt), /prettier: .*SyntaxError/);
+  // A file name can hold a newline followed by the same words.
+  for (const error of [
+    '[error] /p/a\\n[error] No parser could be inferred for file x.js: SyntaxError: Unexpected token (1:1)',
+    '[error] /p/a\\n[error] No parser could be inferred for file \\"x\\".\\n[error] b.js: SyntaxError: Unexpected token (1:1)',
+  ]) {
+    script('node_modules/.bin/prettier', `console.error('${error}'); process.exitCode = 2;`);
+    await assert.rejects(format('a=1\n', file, oxfmt), /prettier: .*\/p\/a/);
+  }
+  // Prettier 2 words it differently.
+  script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file: /p/a.toml"); process.exitCode = 2;');
+  assert.equal(await format('a=1\n', file, oxfmt), 'from oxfmt\n');
+});
+
+test('the kept-loaded Prettier also hands file types it cannot parse to Oxfmt', async t => {
+  const root = repo(t, 'project-formatter-worker-');
+  t.after(stopPrettier);
+  const modules = path.join(root, 'node_modules');
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.mkdirSync(path.join(modules, 'prettier'));
+  fs.writeFileSync(path.join(modules, '.bin', 'prettier'), '');
+  fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
+  // Real Prettier 3 messages: the first has no parser, the second is a syntax error quoting the source.
+  fs.writeFileSync(path.join(modules, 'prettier', 'index.cjs'), `
+    exports.getFileInfo = async () => ({ ignored: false });
+    exports.resolveConfig = async () => ({});
+    exports.format = async (text, { filepath }) => {
+      if (filepath.endsWith('.toml')) throw new Error('No parser could be inferred for file "a.toml".');
+      throw new Error('Unexpected token (1:1)\\n> 1 | No parser could be inferred for file "x"\\n    | ^');
+    };
+  `);
+  const oxfmt = path.join(root, 'oxfmt');
+  fs.writeFileSync(oxfmt, '#!/usr/bin/env node\nconsole.log("from oxfmt");\n', { mode: 0o755 });
+  assert.equal(await format('a=1\n', path.join(root, 'a.toml'), oxfmt), 'from oxfmt\n');
+  await assert.rejects(format('a=1\n', path.join(root, 'a.js'), oxfmt), /prettier: Unexpected token/);
 });

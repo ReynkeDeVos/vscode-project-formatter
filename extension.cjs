@@ -1,14 +1,10 @@
 const vscode = require('vscode');
-const { format, oxcPath, stopPrettier } = require('./formatter.cjs');
+const { documentPath, format, oxcPath, selector, stopPrettier } = require('./formatter.cjs');
 
 exports.activate = context => {
   const output = vscode.window.createOutputChannel('Project Formatter');
-  const languages = [
-    'javascript', 'javascriptreact', 'typescript', 'typescriptreact', 'html', 'css', 'scss', 'less',
-    'json', 'jsonc', 'json5', 'yaml', 'toml', 'markdown', 'mdx', 'graphql', 'handlebars', 'mjml', 'vue', 'svelte',
-  ];
   context.subscriptions.push(output, { dispose: stopPrettier }, vscode.languages.registerDocumentFormattingEditProvider(
-    languages.map(language => ({ language, scheme: 'file' })),
+    selector,
     {
       async provideDocumentFormattingEdits(document, options, token) {
         if (!vscode.workspace.isTrusted || token.isCancellationRequested) return [];
@@ -18,7 +14,7 @@ exports.activate = context => {
           const input = document.getText();
           const oxc = vscode.workspace.getConfiguration('oxc', document.uri);
           const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-          const formatted = await format(input, document.fileName,
+          const formatted = await format(input, documentPath(document, root),
             oxcPath(oxc.get('path.oxfmt'), root), oxcPath(oxc.get('path.node'), root), abort.signal,
             message => output.appendLine(message));
           if (token.isCancellationRequested || formatted === input) return [];
