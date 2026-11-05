@@ -225,7 +225,7 @@ test('Oxfmt takes file types Prettier cannot parse and skips names it does not k
   };
   fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
   fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
-  script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file"); process.exitCode = 2;');
+  script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file \\"a.toml\\"."); process.exitCode = 2;');
   const oxfmt = script('oxfmt', 'console.log("from oxfmt");');
   const file = path.join(root, 'a.toml');
   const log = [];
