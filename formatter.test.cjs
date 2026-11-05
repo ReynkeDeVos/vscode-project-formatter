@@ -233,8 +233,35 @@ test('Oxfmt takes file types Prettier cannot parse and skips names it does not k
   assert.ok(log.some(message => message.includes('oxfmt (Prettier has no parser for this file)')));
   script('oxfmt', 'console.error("Unsupported file type for stdin-filepath"); process.exitCode = 1;');
   assert.equal(await format('a=1\n', file, oxfmt), 'a=1\n');
-  script('oxfmt', 'console.error("real failure"); process.exitCode = 2;');
-  await assert.rejects(format('a=1\n', file, oxfmt), /real failure/);
-  script('node_modules/.bin/prettier', 'console.error("[error] SyntaxError: broken"); process.exitCode = 2;');
+  // Syntax errors quote the source, which can contain the same words as the diagnostics above.
+  script('oxfmt', 'console.error("  x Unexpected token\\n 1 | Unsupported file type for stdin-filepath"); process.exitCode = 2;');
+  await assert.rejects(format('a=1\n', file, oxfmt), /Unexpected token/);
+  script('oxfmt', 'console.log("from oxfmt");');
+  script('node_modules/.bin/prettier', 'console.error("[warn] Ignored unknown option\\n[error] No parser could be inferred for file \\"a.toml\\"."); process.exitCode = 2;');
+  assert.equal(await format('a=1\n', file, oxfmt), 'from oxfmt\n');
+  script('node_modules/.bin/prettier', 'console.error("[error] a.js: SyntaxError: Unexpected token (1:1)\\n[error] > 1 | No parser could be inferred for file \\"x\\""); process.exitCode = 2;');
   await assert.rejects(format('a=1\n', file, oxfmt), /prettier: .*SyntaxError/);
+});
+
+test('the kept-loaded Prettier also hands file types it cannot parse to Oxfmt', async t => {
+  const root = repo(t, 'project-formatter-worker-');
+  t.after(stopPrettier);
+  const modules = path.join(root, 'node_modules');
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.mkdirSync(path.join(modules, 'prettier'));
+  fs.writeFileSync(path.join(modules, '.bin', 'prettier'), '');
+  fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
+  // Real Prettier 3 messages: the first has no parser, the second is a syntax error quoting the source.
+  fs.writeFileSync(path.join(modules, 'prettier', 'index.cjs'), `
+    exports.getFileInfo = async () => ({ ignored: false });
+    exports.resolveConfig = async () => ({});
+    exports.format = async (text, { filepath }) => {
+      if (filepath.endsWith('.toml')) throw new Error('No parser could be inferred for file "a.toml".');
+      throw new Error('Unexpected token (1:1)\\n> 1 | No parser could be inferred for file "x"\\n    | ^');
+    };
+  `);
+  const oxfmt = path.join(root, 'oxfmt');
+  fs.writeFileSync(oxfmt, '#!/usr/bin/env node\nconsole.log("from oxfmt");\n', { mode: 0o755 });
+  assert.equal(await format('a=1\n', path.join(root, 'a.toml'), oxfmt), 'from oxfmt\n');
+  await assert.rejects(format('a=1\n', path.join(root, 'a.js'), oxfmt), /prettier: Unexpected token/);
 });

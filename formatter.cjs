@@ -206,7 +206,7 @@ async function run(command, input, file, nodePath, signal, log) {
     }, (error, stdout, stderr) => {
       if (stderr) log(stderr.trim());
       // Oxfmt skips file names it does not know, as the Oxc extension does.
-      if (error && command.tool === 'oxfmt' && /Unsupported file type/.test(stderr)) return resolve(input);
+      if (error?.code === 1 && command.tool === 'oxfmt' && stderr.trim() === 'Unsupported file type for stdin-filepath') return resolve(input);
       if (error) return reject(new Error(`${command.tool}: ${stderr.trim() || error.message}`, { cause: error }));
       resolve(stdout);
     });
@@ -224,7 +224,8 @@ async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) 
   } catch (error) {
     // The project's formatter decides only for file types it can parse; the rest, like TOML under Prettier, go to Oxfmt.
     // shortcut: only Prettier's message is recognized; add Biome's and dprint's when a project needs them.
-    if (!/No parser could be inferred/.test(error.message)) throw error;
+    // A whole line, because syntax errors quote the source and that could contain the same words.
+    if (command.tool !== 'prettier' || !/^(?:prettier: )?(?:\[error\] )?No parser could be inferred for file /m.test(error.message)) throw error;
     const fallback = { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' };
     return run(invocation(file, oxfmtPath, fallback), input, file, nodePath, signal, log);
   }
