@@ -22,6 +22,29 @@ const oxfmtConfigs = [
   '.oxfmtrc.json', '.oxfmtrc.jsonc',
   ...['js', 'mjs', 'cjs', 'ts', 'mts', 'cts'].map(ext => `oxfmt.config.${ext}`),
 ];
+// The documents the Oxc extension formats, so VS Code never reports this default formatter as unable to format them:
+// its languages in any scheme, each with the file extension that selects the same syntax, plus its file patterns on disk.
+const languageExtensions = {
+  javascript: 'js', typescript: 'ts', javascriptreact: 'jsx', typescriptreact: 'tsx', css: 'css', graphql: 'graphql',
+  handlebars: 'hbs', json: 'json', jsonc: 'jsonc', json5: 'json5', less: 'less', markdown: 'md', mdx: 'mdx', mjml: 'mjml',
+  html: 'html', scss: 'scss', toml: 'toml', vue: 'vue', yaml: 'yaml', svelte: 'svelte', astro: 'astro',
+};
+const fileExtensions = 'cjs,cts,js,jsx,mjs,mts,ts,tsx,_js,bones,es,es6,gs,jake,javascript,jsb,jscad,jsfl,jslib,jsm,jspre,jss,njs,pac,sjs,ssjs,xsjs,xsjslib,frag,json,4DForm,4DProject,avsc,geojson,gltf,har,ice,JSON-tmLanguage,json.example,mcmeta,sarif,tact,tfstate,tfstate.backup,topojson,webapp,webmanifest,yy,yyp,jsonc,json5,code-snippets,code-workspace,sublime-build,sublime-color-scheme,sublime-commands,sublime-completions,sublime-keymap,sublime-macro,sublime-menu,sublime-mousemap,sublime-project,sublime-settings,sublime-theme,sublime-workspace,sublime_metrics,sublime_session,html,hta,htm,inc,xht,xhtml,vue,mjml,css,wxss,pcss,postcss,less,scss,graphql,gql,graphqls,handlebars,hbs,md,livemd,markdown,mdown,mdwn,mkd,mkdn,mkdown,ronn,scd,workbook,mdx,yml,mir,reek,rviz,sublime-syntax,syntax,yaml,yaml-tmlanguage,toml,toml.example,svelte,astro';
+const fileNames = ['Jakefile', '.all-contributorsrc', '.arcconfig', '.auto-changelog', '.c8rc', '.htmlhintrc', '.imgbotconfig', '.nycrc', '.tern-config', '.tern-project', '.watchmanconfig', '.babelrc', '.jscsrc', '.jshintrc', '.jslintrc', '.swcrc', 'contents.lr', 'README', '.clang-format', '.clang-tidy', '.clangd', '.gemrc', 'CITATION.cff', 'glide.lock', 'pixi.lock', '.prettierrc', '.stylelintrc', '.lintstagedrc', 'Pipfile', 'Cargo.toml.orig'];
+const selector = [
+  { pattern: `**/*.{${fileExtensions}}`, scheme: 'file' },
+  ...fileNames.map(name => ({ pattern: `**/${name}`, scheme: 'file' })),
+  ...Object.keys(languageExtensions).map(language => ({ language })),
+];
+
+// The path a formatter sees. A document without a file of its own (settings.json, untitled, a notebook cell) gets one
+// at its own location or the workspace root, so project config applies, and named after its language's syntax.
+function documentPath({ fileName, languageId, uri }, root) {
+  if (uri.scheme === 'file') return fileName;
+  const file = path.resolve(root || os.homedir(), fileName);
+  const extension = `.${languageExtensions[languageId]}`;
+  return file.endsWith(extension) ? file : file + extension;
+}
 
 // The file's folder and its parents, up to the repository root or home.
 function projectDirs(file) {
@@ -104,8 +127,7 @@ function nativeProgram(tool, launcher) {
   return candidates.find(candidate => fs.existsSync(candidate));
 }
 
-function invocation(file, oxfmtPath) {
-  const selection = detect(file);
+function invocation(file, oxfmtPath, selection = detect(file)) {
   const local = projectDirs(file).map(dir => path.join(dir, 'node_modules', '.bin', selection.tool))
     .find(candidate => fs.existsSync(candidate));
   // An explicit oxc.path.oxfmt beats node_modules, as in the Oxc extension.
@@ -167,8 +189,7 @@ function stopPrettier() {
   prettierProcesses.clear();
 }
 
-async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) {
-  const command = invocation(file, oxfmtPath);
+async function run(command, input, file, nodePath, signal, log) {
   log(`${file}: ${command.tool} (${command.reason})${command.prettier ? ', kept loaded' : ''}`);
   const env = { ...process.env, PATH: [
     nodePath && path.dirname(nodePath), process.env.PATH,
@@ -184,6 +205,8 @@ async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) 
       cwd: command.cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 16 * 1024 * 1024, signal,
     }, (error, stdout, stderr) => {
       if (stderr) log(stderr.trim());
+      // Oxfmt skips file names it does not know, as the Oxc extension does.
+      if (error && command.tool === 'oxfmt' && /Unsupported file type/.test(stderr)) return resolve(input);
       if (error) return reject(new Error(`${command.tool}: ${stderr.trim() || error.message}`, { cause: error }));
       resolve(stdout);
     });
@@ -194,4 +217,17 @@ async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) 
   return output;
 }
 
-module.exports = { detect, invocation, format, oxcPath, stopPrettier };
+async function format(input, file, oxfmtPath, nodePath, signal, log = () => {}) {
+  const command = invocation(file, oxfmtPath);
+  try {
+    return await run(command, input, file, nodePath, signal, log);
+  } catch (error) {
+    // The project's formatter decides only for file types it can parse; the rest, like TOML under Prettier, go to Oxfmt.
+    // shortcut: only Prettier's message is recognized; add Biome's and dprint's when a project needs them.
+    if (!/No parser could be inferred/.test(error.message)) throw error;
+    const fallback = { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' };
+    return run(invocation(file, oxfmtPath, fallback), input, file, nodePath, signal, log);
+  }
+}
+
+module.exports = { detect, documentPath, invocation, format, oxcPath, selector, stopPrettier };
