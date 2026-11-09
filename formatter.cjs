@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { execFile, fork } = require('node:child_process');
+const { execFile, fork, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 
 // Each formatter's npm package and the arguments that format stdin as a named file. Order is dependency precedence.
@@ -210,46 +210,159 @@ function stopPrettier() {
   prettierProcesses.clear();
 }
 
-async function run(command, input, file, nodePath, signal, log) {
-  log(`${file}: ${command.tool} (${command.reason})${command.prettier ? ', kept loaded' : ''}`);
-  const env = { ...process.env, PATH: [
+function toolEnv(nodePath) {
+  return { ...process.env, PATH: [
     nodePath && path.dirname(nodePath), process.env.PATH,
     // shortcut: only mise shims are added for editors started without the shell PATH; add other version managers when asked.
     path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims'),
   ].filter(Boolean).join(path.delimiter) };
+}
+
+// Runs a program with input on stdin; failures come back as `error`, with the exit code or `ENOENT` as its `code`, as from
+// execFile. In a process group of its own, so a timeout or a cancellation also ends what it started, like rumdl's formatters.
+function execute(executable, args, input, { cwd, env, signal }) {
+  return new Promise(resolve => {
+    if (signal?.aborted) return resolve({ error: signal.reason, stdout: '', stderr: '' });
+    const output = { stdout: [], stderr: [] };
+    let error;
+    const child = spawn(executable, args, { cwd, env, detached: true });
+    const stop = reason => {
+      error ??= reason;
+      try { process.kill(-child.pid, 'SIGTERM'); } catch {} // Not started, or already ended.
+    };
+    const timer = setTimeout(() => stop(Object.assign(new Error('timed out after 15 seconds'), { killed: true })), 15000);
+    const abort = () => stop(signal.reason);
+    signal?.addEventListener('abort', abort);
+    // As execFile's maxBuffer: at most 16 MB on each stream.
+    for (const [name, chunks] of Object.entries(output)) {
+      let bytes = 0;
+      child[name].on('data', chunk => {
+        if ((bytes += chunk.length) > 16 * 1024 * 1024) return stop(Object.assign(new Error(`${name} larger than 16 MB`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+        chunks.push(chunk);
+      });
+    }
+    child.on('error', spawnError => { error ??= spawnError; });
+    child.on('close', (code, killedBy) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      if (!error && (code || killedBy)) error = Object.assign(new Error(`exited with ${code ?? killedBy}`), { code });
+      resolve({ error, stdout: Buffer.concat(output.stdout).toString(), stderr: Buffer.concat(output.stderr).toString() });
+    });
+    child.stdin.on('error', () => {}); // Process failures are reported by 'error' and 'close'.
+    child.stdin.end(input);
+  });
+}
+
+async function run(command, input, file, env, signal, log) {
+  log(`${file}: ${command.tool} (${command.reason})${command.prettier ? ', kept loaded' : ''}`);
   if (command.tool === 'bun') {
     const { stdout } = await promisify(execFile)(command.executable, ['--help'], { cwd: command.cwd, env, encoding: 'utf8', timeout: 5000, signal });
     if (!/^\s+fmt\s/m.test(stdout)) throw new Error('This Bun installation does not include bun fmt. File kept unchanged.');
   }
-  const output = command.prettier ? await formatWithPrettier(command, input, file, env, signal) : await new Promise((resolve, reject) => {
-    const child = execFile(command.executable, command.args, {
-      cwd: command.cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 16 * 1024 * 1024, signal,
-    }, (error, stdout, stderr) => {
-      if (stderr) log(stderr.trim());
-      // Oxfmt skips file names it does not know, as the Oxc extension does.
-      if (error?.code === 1 && command.tool === 'oxfmt' && stderr.trim() === 'Unsupported file type for stdin-filepath') return resolve(input);
-      if (error) return reject(new Error(`${command.tool}: ${stderr.trim() || error.message}`, { cause: error }));
-      resolve(stdout);
-    });
-    child.stdin.on('error', () => {}); // Process failures are reported by execFile's callback.
-    child.stdin.end(input);
-  });
+  let output;
+  if (command.prettier) output = await formatWithPrettier(command, input, file, env, signal);
+  else {
+    const { error, stdout, stderr } = await execute(command.executable, command.args, input, { cwd: command.cwd, env, signal });
+    if (stderr) log(stderr.trim());
+    // Oxfmt skips file names it does not know, as the Oxc extension does.
+    if (error?.code === 1 && command.tool === 'oxfmt' && stderr.trim() === 'Unsupported file type for stdin-filepath') return input;
+    if (error) throw new Error(`${command.tool}: ${stderr.trim() || error.message}`, { cause: error });
+    output = stdout;
+  }
   if (input.trim() && !output.trim()) throw new Error(`${command.tool} returned empty output; file kept unchanged.`);
   return output;
 }
 
-async function format(input, file, oxc = {}, signal, log = () => {}) {
-  const command = invocation(file, oxc);
+// The length of the front matter, found as Prettier 3 finds it: YAML or TOML, which rumdl would take for Markdown.
+// It ends at the first line starting with its opening delimiter; YAML, if there is none, at the first one starting with `...`.
+function frontMatterLength(text) {
+  const start = text.slice(0, 3);
+  const lineBreak = text.indexOf('\n', 3);
+  if ((start !== '---' && start !== '+++') || lineBreak === -1) return 0;
+  let end = text.indexOf(`\n${start}`, lineBreak);
+  if (end === -1 && start === '---' && ['', 'yaml'].includes(text.slice(3, lineBreak).trim())) end = text.indexOf('\n...', lineBreak);
+  return end === -1 ? 0 : end + 4;
+}
+
+// A fence that may hold Python or C#; only spares a rumdl run for files without one.
+const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
+
+// Markdown formatters leave Python and C# blocks alone. rumdl finds them with its Markdown parser, also in lists and blockquotes,
+// and hands each to Ruff or CSharpier; a block a tool cannot format, like a C# method without its class, stays as it is.
+async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
+  // Prettier finds front matter after a byte order mark.
+  const bom = markdown.startsWith('\uFEFF') ? 1 : 0;
+  const front = markdown.slice(0, bom + frontMatterLength(markdown.slice(bom)));
+  const body = markdown.slice(front.length);
+  if (!codeFence.test(body)) return markdown;
+  // Where rumdl reads Markdown differently from Prettier, a fence that is text could be formatted as code: rumdl takes a line of
+  // form feeds or vertical tabs for a blank line, which ends an HTML block early, and has no `$$` math blocks.
+  const unsafe = /[\v\f]/.test(body) ? 'a form feed or vertical tab'
+    : /^(?:[ \t]*(?:>|[-+*](?=[ \t])|\d{1,9}[.)](?=[ \t])))*[ \t]*\$\$/m.test(body) ? 'a $$ math block' : undefined;
+  if (unsafe) {
+    log(`rumdl: Python and C# blocks stay as they are, since this file has ${unsafe}.`);
+    return markdown;
+  }
+  // rumdl formats code blocks only in a file, so it gets a copy. The tools read the project's config from the document's folder.
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-formatter-'));
   try {
-    return await run(command, input, file, oxc.nodePath, signal, log);
+    const copy = path.join(dir, path.basename(file));
+    const config = path.join(dir, 'rumdl.toml');
+    // A JSON string is a TOML string, once DEL is escaped too.
+    const snippet = extension => JSON.stringify(path.join(path.dirname(file), `snippet.${extension}`)).replaceAll('\x7f', '\\u007f');
+    await fs.promises.writeFile(copy, body);
+    await fs.promises.writeFile(config, `[code-block-tools]
+enabled = true
+on-error = "warn"
+
+[code-block-tools.languages]
+python = { format = ["ruff"] }
+csharp = { format = ["csharpier"] }
+
+[code-block-tools.tools.ruff]
+command = ["ruff", "format", "--stdin-filename", ${snippet('py')}, "-"]
+stdin = true
+stdout = true
+
+[code-block-tools.tools.csharpier]
+command = ["csharpier", "format", "--stdin-path", ${snippet('cs')}]
+stdin = true
+stdout = true
+`);
+    const { error, stdout, stderr } = await execute('rumdl', ['fmt', '--only-code-block-tools', '--no-cache', '--quiet', '--config', config, copy], '', { cwd, env, signal });
+    signal?.throwIfAborted();
+    // rumdl counts lines without the front matter and before formatting.
+    const lines = front.split('\n').length - 1;
+    const messages = `${stdout}\n${stderr}`.trim().replaceAll(/^Warning: .*?:(\d+): /gm, (_, line) => `line ${Number(line) + lines} before formatting: `);
+    if (error) {
+      log(error.code === 'ENOENT' ? 'rumdl is not installed; Python and C# blocks stay as they are.' : `rumdl: ${messages || error.message}`);
+      return markdown;
+    }
+    if (messages) log(`rumdl: ${messages}`);
+    const result = await fs.promises.readFile(copy, 'utf8');
+    return result.trim() ? front + result : markdown;
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function format(input, file, oxc = {}, signal, log = () => {}) {
+  const env = toolEnv(oxc.nodePath);
+  const command = invocation(file, oxc);
+  let output;
+  try {
+    output = await run(command, input, file, env, signal, log);
   } catch (error) {
     // The project's formatter decides only for file types it can parse; the rest, like TOML under Prettier, go to Oxfmt.
     // shortcut: only Prettier's message is recognized; add Biome's and dprint's when a project needs them.
     // The whole message after any warnings, because syntax errors quote the source and file name, which can contain these words.
     if (!/^prettier: (?:\[warn\] .*\n)*(?:\[error\] )?No parser could be inferred for file:? .*$/.test(error.message)) throw error;
     const fallback = { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' };
-    return run(invocation(file, oxc, fallback), input, file, oxc.nodePath, signal, log);
+    output = await run(invocation(file, oxc, fallback), input, file, env, signal, log);
   }
+  // dprint hands code blocks to its own plugins.
+  if (command.tool === 'dprint' || !/\.(?:md|markdown)$/i.test(file)) return output;
+  return formatCodeBlocks(output, file, command.cwd, env, signal, log);
 }
 
 module.exports = { detect, documentPath, invocation, format, oxcPath, oxcRules, stopPrettier };

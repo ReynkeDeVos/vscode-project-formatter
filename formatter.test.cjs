@@ -359,3 +359,166 @@ test('the kept-loaded Prettier also hands file types it cannot parse to Oxfmt', 
   assert.equal(await format('a=1\n', path.join(root, 'a.toml'), oxfmt), 'from oxfmt\n');
   await assert.rejects(format('a=1\n', path.join(root, 'a.js'), oxfmt), /prettier: Unexpected token/);
 });
+
+// A stand-in for rumdl on a PATH without the real tools: it formats `x=1` and reports a block with `broken` as rumdl does.
+function rumdlStub(t, root) {
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  const { PATH, MISE_DATA_DIR } = process.env;
+  process.env.PATH = [bin, path.dirname(process.execPath)].join(path.delimiter);
+  process.env.MISE_DATA_DIR = root; // No mise shims either.
+  t.after(() => {
+    process.env.PATH = PATH;
+    if (MISE_DATA_DIR === undefined) delete process.env.MISE_DATA_DIR; else process.env.MISE_DATA_DIR = MISE_DATA_DIR;
+  });
+  const calls = path.join(root, 'calls');
+  fs.writeFileSync(path.join(bin, 'rumdl'), `#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path');
+const args = process.argv.slice(2), file = args.at(-1), text = fs.readFileSync(file, 'utf8');
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ args, text, config: fs.readFileSync(args[args.indexOf('--config') + 1], 'utf8') }) + '\\n');
+if (text.includes('crash')) { console.error('error: disk full'); process.exit(2); }
+if (text.includes('broken')) console.log('Warning: ' + path.basename(file) + ':3: [csharpier] Error snippet.cs - Was not formatted due to syntax errors.\\n  (1,1): error CS1002');
+fs.writeFileSync(file, text.includes('empty') ? '' : text.replaceAll('x=1', 'x = 1'));
+`, { mode: 0o755 });
+  return () => fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+}
+
+test('Markdown: rumdl formats the Python and C# blocks, never the front matter', async t => {
+  const root = repo(t, 'project-formatter-code-blocks-');
+  const calls = rumdlStub(t, root);
+  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
+  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', { mode: 0o755 });
+  const file = path.join(root, 'docs', 'lesson.md');
+  const log = [];
+  const run = (input, name = file) => format(input, name, oxfmt, undefined, message => log.push(message));
+  const body = '# Lesson\n\n```py\nx=1\n```\n';
+  // Front matter as Prettier finds it; its fences are text, not code blocks. It ends at its opening delimiter, even after a
+  // `...`, and YAML ends at `...` only without a closing `---`.
+  for (const front of [
+    '---\nsnippet: |\n  ```py\n  x=1\n  ```\n---', '---\nx=1\n...', '---yaml\nx=1\n...', '+++\nx=1\n+++',
+    "+++\nsnippet = '''\n...\n```py\nx=1\n```\n'''\n+++", '---\na: |\n  ...\n  ```py\n  x=1\n  ```\n---',
+  ]) {
+    assert.equal(await run(`${front}\n${body}`), `${front}\n${body.replace('x=1', 'x = 1')}`);
+    assert.equal(calls().at(-1).text, `\n${body}`);
+  }
+  // After a byte order mark too, which stays.
+  for (const front of ['\uFEFF---\na: |\n  ```py\n  x=1\n  ```\n---', "\uFEFF+++\na = '''\n```py\nx=1\n```\n'''\n+++"]) {
+    assert.equal(await run(`${front}\n${body}`), `${front}\n${body.replace('x=1', 'x = 1')}`);
+  }
+  assert.equal(await run(`\uFEFF${body}`), `\uFEFF${body.replace('x=1', 'x = 1')}`);
+  // Only YAML ends with `...`.
+  for (const front of ['+++\nx=1\n...', '---json\nx=1\n...']) {
+    assert.equal(await run(`${front}\n${body}`), `${front.replace('x=1', 'x = 1')}\n${body.replace('x=1', 'x = 1')}`);
+  }
+  // One run on a copy in a temporary folder; the tools read the config of the document's folder.
+  const { args, config } = calls()[0];
+  const copy = args.at(-1);
+  assert.deepEqual(args.slice(0, -1), ['fmt', '--only-code-block-tools', '--no-cache', '--quiet', '--config', path.join(path.dirname(copy), 'rumdl.toml')]);
+  assert.equal(path.basename(copy), 'lesson.md');
+  assert.equal(fs.existsSync(path.dirname(copy)), false);
+  assert.ok(config.includes(`command = ["ruff", "format", "--stdin-filename", ${JSON.stringify(path.join(root, 'docs', 'snippet.py'))}, "-"]`), config);
+  assert.ok(config.includes(`command = ["csharpier", "format", "--stdin-path", ${JSON.stringify(path.join(root, 'docs', 'snippet.cs'))}]`), config);
+  // A block a tool left alone is reported at its line in the document.
+  await run('---\na: 1\n---\n\n```cs\nbroken\n```\n');
+  assert.ok(log.includes('rumdl: line 5 before formatting: [csharpier] Error snippet.cs - Was not formatted due to syntax errors.\n  (1,1): error CS1002'), log.join('\n'));
+  // rumdl takes a line of form feeds for a blank line, which would end this HTML block early, so it is not run.
+  const before = calls().length;
+  log.length = 0;
+  assert.equal(await run('<div>\n\f\n```py\nx=1\n```\n</div>\n'), '<div>\n\f\n```py\nx=1\n```\n</div>\n');
+  assert.equal(calls().length, before);
+  assert.ok(log.includes('rumdl: Python and C# blocks stay as they are, since this file has a form feed or vertical tab.'), log.join('\n'));
+  // rumdl has no math blocks, so a fence inside one, which Prettier reads as math, would be formatted.
+  for (const math of ['$$\n```py\nx=1\n```\n$$\n', '> $$\n> ```py\n> x=1\n> ```\n> $$\n', '- $$\n  ```py\n  x=1\n  ```\n  $$\n']) {
+    assert.equal(await run(math), math);
+  }
+  assert.equal(calls().length, before);
+  assert.ok(log.includes('rumdl: Python and C# blocks stay as they are, since this file has a $$ math block.'), log.join('\n'));
+  // DEL is valid in a folder name but not in a TOML string.
+  await run(body, path.join(root, 'odd\x7fname', 'a.md'));
+  assert.ok(calls().at(-1).config.includes('odd\\u007fname'), calls().at(-1).config);
+  // A failed or empty run leaves the document as it is.
+  for (const [input, message] of [['```cs\ncrash\n```\n', 'rumdl: error: disk full'], ['```cs\nempty\n```\n', undefined]]) {
+    log.length = 0;
+    assert.equal(await run(input), input);
+    if (message) assert.ok(log.includes(message), log.join('\n'));
+  }
+  // Only Markdown with a Python or C# fence, and never under dprint, whose plugins format code blocks.
+  const runs = calls().length;
+  assert.equal(await run('x=1\n', path.join(root, 'a.ts')), 'x=1\n');
+  assert.equal(await run('```ts\nx=1\n```\n'), '```ts\nx=1\n```\n');
+  fs.writeFileSync(path.join(root, 'dprint.json'), '{}');
+  fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'dprint'), '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', { mode: 0o755 });
+  assert.equal(await run(body), body);
+  assert.equal(calls().length, runs);
+  fs.rmSync(path.join(root, 'dprint.json'));
+  fs.rmSync(path.join(root, 'bin', 'rumdl'));
+  log.length = 0;
+  assert.equal(await run(body), body);
+  assert.ok(log.includes('rumdl is not installed; Python and C# blocks stay as they are.'), log.join('\n'));
+});
+
+// Fails when an update of rumdl, Ruff or CSharpier changes how a block is found or reported.
+const shims = path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims');
+const installed = name => require('node:child_process').spawnSync(name, ['--version'], { env: { ...process.env, PATH: `${process.env.PATH}${path.delimiter}${shims}` } }).status === 0;
+test('Markdown with the installed rumdl, Ruff and CSharpier', { skip: !['rumdl', 'ruff', 'csharpier'].every(installed) }, async t => {
+  // A folder name that needs escaping in rumdl's TOML config.
+  const root = path.join(repo(t, 'project-formatter-code-blocks-real-'), 'a "quoted" folder');
+  fs.mkdirSync(root);
+  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
+  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', { mode: 0o755 });
+  const log = [];
+  const run = input => format(input, path.join(root, 'a.md'), oxfmt, undefined, message => log.push(message));
+  // Code blocks in lists and blockquotes, with CRLF too, and a method without its class, which stays.
+  assert.equal(await run('```python\ndef f( a ):\n  return a\n```\n\n- C#:\n\n  ```csharp\n  if(x){y();}\n  ```\n\n> ```cs\n> var q=1;\n> ```\n\n```cs\npublic int Add(int a,int b){return a+b;}\n```\n'),
+    '```python\ndef f(a):\n    return a\n```\n\n- C#:\n\n  ```csharp\n  if (x)\n  {\n      y();\n  }\n  ```\n\n> ```cs\n> var q = 1;\n> ```\n\n```cs\npublic int Add(int a,int b){return a+b;}\n```\n');
+  assert.ok(log.some(message => message.startsWith('rumdl: line 16 before formatting: [csharpier]')), log.join('\n'));
+  assert.equal(await run('```cs\r\nvar x=1;\r\n```\r\n'), '```cs\r\nvar x = 1;\r\n```\r\n');
+  // Fences that are text: in a list's longer fence, in an indented code block, in HTML and in front matter.
+  for (const literal of [
+    '- ````text\n  ```cs\n  var x=1;\n  ```\n  ````\n',
+    '    ```cs\n    var inside=1;\n\nvar outside=2;\n\n```\nAfter\n```\n',
+    '<!--\n```python\nx=1\n```\n-->\n',
+    '<div>\n \n```cs\nvar x=1;\n```\n</div>\n',
+    '---\nsnippet: |\n  ```cs\n  var x=1;\n  ```\n...\n',
+  ]) assert.equal(await run(literal), literal);
+  // CSharpier prints nothing for a file its ignore file names, and rumdl then keeps the block.
+  fs.writeFileSync(path.join(root, '.csharpierignore'), '*\n');
+  assert.equal(await run('```cs\nvar x=1;\n```\n'), '```cs\nvar x=1;\n```\n');
+});
+
+test('a cancelled tool ends together with the programs it started', async t => {
+  const root = repo(t, 'project-formatter-process-group-');
+  const pids = path.join(root, 'pids');
+  // A stand-in for rumdl that starts a slow formatter and waits for it.
+  const tool = path.join(root, 'tool');
+  fs.writeFileSync(tool, `#!/usr/bin/env node
+const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+require('node:fs').writeFileSync(${JSON.stringify(pids)}, String(child.pid));
+child.on('exit', () => process.exit());
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(root, '.oxfmtrc.json'), '{}');
+  const abort = new AbortController();
+  const formatting = format('x\n', path.join(root, 'a.ts'), { oxfmtPath: tool }, abort.signal);
+  const wait = () => new Promise(resolve => setTimeout(resolve, 10));
+  while (!(fs.existsSync(pids) && fs.readFileSync(pids, 'utf8'))) await wait();
+  abort.abort();
+  await assert.rejects(formatting, /aborted/);
+  const alive = pid => { try { return process.kill(pid, 0); } catch { return false; } };
+  const formatter = Number(fs.readFileSync(pids, 'utf8'));
+  for (let tries = 0; alive(formatter) && tries < 200; tries++) await wait();
+  assert.equal(alive(formatter), false);
+});
+
+test('a tool printing more than 16 MB on either stream fails, as with execFile', async t => {
+  const root = repo(t, 'project-formatter-output-limit-');
+  fs.writeFileSync(path.join(root, '.oxfmtrc.json'), '{}');
+  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
+  // 18 MB in 6 million characters, so the limit counts bytes.
+  for (const [stream, text] of [['stdout', '€'.repeat(6e6)], ['stderr', 'x'.repeat(17 * 1024 * 1024)]]) {
+    fs.writeFileSync(oxfmt.oxfmtPath, `#!/usr/bin/env node\nprocess.${stream}.write(${JSON.stringify(text.slice(0, 1))}.repeat(${text.length}));\n`, { mode: 0o755 });
+    // With stderr as the message, as before; the limit is the cause.
+    await assert.rejects(format('x\n', path.join(root, 'a.ts'), oxfmt), error => (error.cause ?? error).message.endsWith(`${stream} larger than 16 MB`));
+  }
+});
