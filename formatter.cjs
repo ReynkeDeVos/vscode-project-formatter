@@ -280,37 +280,51 @@ const languages = { python: ['python', 'py', 'python3', 'py3'], csharp: ['csharp
 // A fence that may hold Python or C#; only spares parsing a file without one.
 const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
 
-// The package a formatter's executable belongs to. npm, pnpm and aube put `node_modules/.bin/<tool>` next to the package, and
-// npm links into it. A bare name is looked up on the PATH, and a mise shim through `mise which`.
-async function packageOf(tool, executable, cwd, env) {
+// The package an executable runs from: the nearest package.json above its real path, if named like the tool; else, for a shim
+// script in `node_modules/.bin` (pnpm, aube), the package next to it. Nothing else, so only code the formatter itself runs is
+// loaded. A bare name is looked up on the PATH, a mise shim through `mise which`.
+async function packageOf(tool, executable, cwd, env, signal) {
   let bin = path.isAbsolute(executable) ? executable
     : env.PATH.split(path.delimiter).map(dir => path.join(dir, executable)).find(candidate => fs.existsSync(candidate));
-  if (bin && path.basename(fs.realpathSync(bin)) === 'mise') bin = (await execute('mise', ['which', tool], '', { cwd, env })).stdout.trim();
-  if (!bin || !fs.existsSync(bin)) return;
+  if (bin && path.basename(fs.realpathSync(bin)) === 'mise') bin = (await execute('mise', ['which', tool], '', { cwd, env, signal })).stdout.trim();
+  signal?.throwIfAborted();
+  if (!bin || !path.isAbsolute(bin) || !fs.existsSync(bin)) return;
   const named = dir => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name === tool; } catch { return false; } };
-  const sibling = path.join(path.dirname(bin), '..', tool);
-  if (named(sibling)) return fs.realpathSync(sibling);
-  for (let dir = path.dirname(fs.realpathSync(bin)); dir !== path.dirname(dir); dir = path.dirname(dir)) if (named(dir)) return dir;
+  const real = fs.realpathSync(bin);
+  let dir = path.dirname(real);
+  while (dir !== path.dirname(dir) && !fs.existsSync(path.join(dir, 'package.json'))) dir = path.dirname(dir);
+  if (named(dir)) return dir;
+  const shims = path.dirname(real);
+  const sibling = path.join(shims, '..', tool);
+  if (path.basename(shims) === '.bin' && path.basename(path.dirname(shims)) === 'node_modules' && named(sibling)) return fs.realpathSync(sibling);
 }
 
-// The Markdown parser of the formatter that ran, so both agree on what is a code block, also after either updates: Prettier's
-// plugin from that Prettier, or the copy in Oxfmt's package, which Oxfmt formats Markdown with.
-async function markdownParser(command, env) {
-  if (command.tool === 'prettier') {
-    const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env);
-    // Prettier 3, then Prettier 2.
-    return root && ['plugins/markdown.js', 'parser-markdown.js'].map(name => path.join(root, name)).find(candidate => fs.existsSync(candidate));
+// The Markdown parser of the formatter that ran, so both agree on what is a code block, also after either updates: Oxfmt's copy
+// of Prettier's plugin in its package, or the plugin of that Prettier with the parser Prettier picks for the file.
+async function markdownParser(command, file, env, signal) {
+  if (command.tool === 'oxfmt') {
+    const root = await packageOf('oxfmt', command.executable, command.cwd, env, signal);
+    // shortcut: Oxfmt names the chunk `markdown-<hash>.js`; a test against the installed Oxfmt notices when that changes.
+    const chunks = root && fs.existsSync(path.join(root, 'dist')) ? fs.readdirSync(path.join(root, 'dist')).filter(name => /^markdown-[\w-]+\.js$/.test(name)) : [];
+    // Oxfmt has no parser option: a Markdown file is Markdown.
+    return chunks.length === 1 ? { module: path.join(root, 'dist', chunks[0]), parser: 'markdown' } : { reason: "no Markdown parser found in oxfmt's package" };
   }
-  if (command.tool !== 'oxfmt') return;
-  const dist = path.join(await packageOf('oxfmt', command.executable, command.cwd, env) ?? '', 'dist');
-  // shortcut: Oxfmt names the chunk `markdown-<hash>.js`; a test against the installed Oxfmt notices when that changes.
-  const chunks = fs.existsSync(dist) ? fs.readdirSync(dist).filter(name => /^markdown-[\w-]+\.js$/.test(name)) : [];
-  return chunks.length === 1 ? path.join(dist, chunks[0]) : undefined;
+  if (command.tool !== 'prettier') return { reason: `${command.tool} has no Markdown parser to find them with` };
+  const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env, signal);
+  // Prettier 3, then Prettier 2.
+  const module = root && ['plugins/markdown.js', 'parser-markdown.js'].map(name => path.join(root, name)).find(candidate => fs.existsSync(candidate));
+  if (!module) return { reason: "no Markdown parser found in prettier's package" };
+  // A config can give Markdown files another parser; MDX reads code inside JSX and exports as code blocks, so only Markdown counts.
+  const { error, stdout } = await execute(command.executable, ['--file-info', file], '', { cwd: command.cwd, env, signal });
+  signal?.throwIfAborted();
+  let parser;
+  try { parser = !error && JSON.parse(stdout).inferredParser; } catch {}
+  return ['markdown', 'remark'].includes(parser) ? { module, parser } : { reason: `prettier formats this file with the ${parser || 'unknown'} parser` };
 }
 
 // Every code node the parser finds: its language, code, offsets, and whether a `prettier-ignore` comment covers it.
-async function codeNodes(text, parser, cwd, env, signal) {
-  const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'markdown-blocks.cjs'), parser], text, { cwd, env, signal });
+async function codeNodes(text, { module, parser }, cwd, env, signal) {
+  const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'markdown-blocks.cjs'), module, parser], text, { cwd, env, signal });
   signal?.throwIfAborted();
   if (error) throw Object.assign(new Error(stderr.trim() || error.message), { code: error.code });
   return JSON.parse(stdout);
@@ -386,9 +400,8 @@ async function formatCSharp(blocks, file, cwd, env, signal, log) {
   }
 }
 
-// Markdown formatters leave Python and C# blocks alone; this formats them with Ruff and CSharpier. `unchanged`: the formatter
-// returned its input, as it does for a file it ignores.
-async function formatCodeBlocks(markdown, file, command, env, signal, log, unchanged) {
+// Markdown formatters leave Python and C# blocks alone; this formats them with Ruff and CSharpier.
+async function formatCodeBlocks(markdown, file, command, env, signal, log) {
   const { cwd } = command;
   // Prettier parses without a byte order mark and with \n line breaks; a file mixing line breaks, or with a lone \r, stays as it is.
   const bom = markdown.startsWith('\uFEFF') ? '\uFEFF' : '';
@@ -397,9 +410,9 @@ async function formatCodeBlocks(markdown, file, command, env, signal, log, uncha
   if (parts.some(part => part.includes('\r') || (eol === '\r\n' && part.includes('\n')))) return markdown;
   const text = parts.join('\n');
   if (!codeFence.test(text)) return markdown;
-  const parser = await markdownParser(command, env);
-  if (!parser) {
-    log(`Python and C# blocks stay as they are: no Markdown parser found in ${command.tool}'s package.`);
+  const parser = await markdownParser(command, file, env, signal);
+  if (parser.reason) {
+    log(`Python and C# blocks stay as they are: ${parser.reason}.`);
     return markdown;
   }
   const parse = async source => {
@@ -413,11 +426,12 @@ async function formatCodeBlocks(markdown, file, command, env, signal, log, uncha
   const nodes = await parse(text);
   const blocks = nodes ? codeBlocks(text, nodes) : [];
   if (!blocks.length) return markdown;
-  // A file it ignores, the formatter returns unchanged, as one already formatted; a heading it would fix tells them apart.
-  const probe = '#  Probe\n';
-  if (unchanged && await run(command, probe, file, env, signal, () => {}).then(output => output === probe, () => true)) {
-    signal?.throwIfAborted();
-    log(`Python and C# blocks stay as they are: ${command.tool} ignores this file.`);
+  // Only a file the formatter prints as Markdown: not one it ignores, by its path or a pragma at its top, or gives another parser.
+  // Its own output with a badly spaced heading appended keeps the path and the pragmas, and a Markdown printer fixes the heading.
+  const probe = await run(command, `${markdown}${eol}#  Probe${eol}`, file, env, signal, () => {}).catch(() => undefined);
+  signal?.throwIfAborted();
+  if (probe !== `${markdown}${eol}# Probe${eol}`) {
+    log(`Python and C# blocks stay as they are: ${command.tool} does not format this file as Markdown (it is ignored, has a pragma or another parser).`);
     return markdown;
   }
   const python = blocks.filter(({ language }) => language === 'python');
@@ -476,7 +490,7 @@ async function format(input, file, oxc = {}, signal, log = () => {}) {
   // dprint hands code blocks to its own plugins.
   if (command.tool === 'dprint' || !/\.(?:md|markdown)$/i.test(file)) return output;
   // With the formatter that ran: its parser finds the blocks.
-  return formatCodeBlocks(output, file, command, env, signal, log, output === input);
+  return formatCodeBlocks(output, file, command, env, signal, log);
 }
 
 module.exports = { detect, documentPath, invocation, format, oxcPath, oxcRules, stopPrettier };

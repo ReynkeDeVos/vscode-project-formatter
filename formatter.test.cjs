@@ -397,10 +397,14 @@ for (const name of fs.readdirSync(dir)) {
   };
 }
 
-// A stand-in for a Markdown formatter: it fixes a heading's spacing, which tells it apart from one ignoring the file.
+// A stand-in for a Markdown formatter: it fixes a heading's spacing, which tells it apart from one ignoring the file, and, as
+// Prettier, names the Markdown parser for `--file-info`.
 const markdownFormatter = `#!/usr/bin/env node
-let text = '';
-process.stdin.on('data', data => text += data).on('end', () => process.stdout.write(text.replace(/^#  /gm, '# ')));
+if (process.argv[2] === '--file-info') console.log('{ "ignored": false, "inferredParser": "markdown" }');
+else {
+  let text = '';
+  process.stdin.on('data', data => text += data).on('end', () => process.stdout.write(text.replace(/^#  /gm, '# ')));
+}
 `;
 
 // That formatter as Oxfmt, in a package with a Markdown chunk shaped like Oxfmt's, made of the Prettier in node_modules.
@@ -477,7 +481,7 @@ test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks the p
   fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n');
   log.length = 0;
   assert.equal(await run('```py\nx=1\n```\n'), '```py\nx=1\n```\n');
-  assert.ok(log.includes('Python and C# blocks stay as they are: oxfmt ignores this file.'), log.join('\n'));
+  assert.ok(log.includes('Python and C# blocks stay as they are: oxfmt does not format this file as Markdown (it is ignored, has a pragma or another parser).'), log.join('\n'));
   fs.writeFileSync(oxfmt.oxfmtPath, formatter);
   // A block that is not valid code on its own is reported at its fence's line.
   log.length = 0;
@@ -543,7 +547,7 @@ test('the Markdown parser is the one of the formatter that ran', async t => {
   const prettier = path.join(root, 'node_modules', 'prettier');
   fs.mkdirSync(path.join(prettier, 'plugins'), { recursive: true });
   fs.mkdirSync(path.join(root, 'node_modules', '.bin'));
-  fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'prettier'), '');
+  fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'prettier'), markdownFormatter, { mode: 0o755 });
   fs.writeFileSync(path.join(prettier, 'index.cjs'), 'exports.getFileInfo = async () => ({ ignored: false }); exports.resolveConfig = async () => ({}); exports.format = async text => text.replace(/^#  /gm, \'# \');');
   fs.writeFileSync(path.join(prettier, 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
   assert.equal(await run(), formatted);
@@ -572,11 +576,113 @@ const which = name => {
 };
 
 // Fails when an Oxfmt update renames or reshapes the Markdown chunk in its package, as the Oxc test above does for Oxc.
-test('the installed Oxfmt still has a Markdown parser to find', { skip: !installed('oxfmt') }, async t => {
+test('the installed Oxfmt still has a Markdown parser to find, and its ignore patterns count', { skip: !installed('oxfmt') }, async t => {
   const oxfmtPath = which('oxfmt');
   const root = repo(t, 'project-formatter-installed-oxfmt-');
   codeBlockTools(t, root);
-  assert.equal(await format('```py\nx=1\n```\n', path.join(root, 'a.md'), { oxfmtPath }), '```py\nx = 1\n```\n');
+  const run = (input, name = 'a.md') => format(input, path.join(root, name), { oxfmtPath });
+  const block = '```py\nx=1\n```\n';
+  assert.equal(await run(block), '```py\nx = 1\n```\n');
+  fs.writeFileSync(path.join(root, '.oxfmtrc.json'), '{ "ignorePatterns": ["b.md"] }');
+  assert.equal(await run(block, 'b.md'), block);
+});
+
+// This repository's Prettier, installed into a project, so it runs kept loaded and answers `--file-info`.
+function realPrettier(root) {
+  const modules = path.join(root, 'node_modules');
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.symlinkSync(path.dirname(require.resolve('prettier/package.json')), path.join(modules, 'prettier'), 'junction');
+  fs.symlinkSync(path.join('..', 'prettier', 'bin', 'prettier.cjs'), path.join(modules, '.bin', 'prettier'));
+}
+
+test('Prettier: only a file it prints as Markdown, as its config, pragmas and ignore file say', async t => {
+  const root = repo(t, 'project-formatter-prettier-markdown-');
+  codeBlockTools(t, root);
+  t.after(stopPrettier);
+  realPrettier(root);
+  let version = 0;
+  // A later time each time, so the kept-loaded Prettier restarts with the new config.
+  const config = (name, contents) => {
+    fs.writeFileSync(path.join(root, name), contents);
+    fs.utimesSync(path.join(root, name), new Date(), new Date(Date.now() + ++version * 1000));
+  };
+  const run = input => format(input, path.join(root, 'a.md'));
+  const block = '```py\nx=1\n```\n';
+  config('.prettierrc', '{}');
+  assert.equal(await run(block), '```py\nx = 1\n```\n');
+  // Another parser for Markdown files: Babel reads this one as JavaScript, whose string holds a fence; MDX reads JSX and
+  // exports as code blocks too.
+  config('.prettierrc', '{ "overrides": [{ "files": "*.md", "options": { "parser": "babel" } }] }');
+  assert.match(await run('const lesson=`\n~~~py\nx=1\n~~~\n`;\n'), /\nx=1\n/);
+  config('.prettierrc', '{ "parser": "mdx" }');
+  assert.match(await run('<Lesson text={`\n\n~~~py\nx=1\n~~~\n\n`} />\n'), /\nx=1\n/);
+  // A pragma: the blocks of a file with the required one are formatted; an ignore pragma keeps them.
+  config('.prettierrc', '{ "requirePragma": true }');
+  assert.equal(await run(`<!-- @format -->\n\n${block}`), '<!-- @format -->\n\n```py\nx = 1\n```\n');
+  assert.equal(await run(block), block);
+  config('.prettierrc', '{ "checkIgnorePragma": true }');
+  assert.equal(await run(`<!-- @noformat -->\n\n${block}`), `<!-- @noformat -->\n\n${block}`);
+  config('.prettierrc', '{}');
+  config('.prettierignore', 'a.md\n');
+  assert.equal(await run(block), block);
+});
+
+test('the parser comes only from the package the formatter runs from', async t => {
+  const root = repo(t, 'project-formatter-parser-trust-');
+  codeBlockTools(t, root);
+  const loaded = path.join(root, 'loaded');
+  const trap = dir => {
+    fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name": "oxfmt"}');
+    fs.writeFileSync(path.join(dir, 'dist', 'markdown-Trap.js'), `require('node:fs').writeFileSync(${JSON.stringify(loaded)}, '');`);
+  };
+  // An Oxfmt linked from elsewhere: the package it runs from counts, not an `oxfmt` folder next to the link.
+  fakeOxfmt(root);
+  const own = path.join(root, 'tools', 'node_modules', 'oxfmt', 'bin', 'oxfmt');
+  fs.mkdirSync(path.dirname(own));
+  fs.writeFileSync(own, markdownFormatter, { mode: 0o755 });
+  fs.mkdirSync(path.join(root, 'links', 'bin'), { recursive: true });
+  fs.symlinkSync(own, path.join(root, 'links', 'bin', 'oxfmt'));
+  trap(path.join(root, 'links', 'oxfmt'));
+  const file = path.join(root, 'a.md');
+  assert.equal(await format('```py\nx=1\n```\n', file, { oxfmtPath: path.join(root, 'links', 'bin', 'oxfmt') }), '```py\nx = 1\n```\n');
+  // An Oxfmt in no package has no parser; nothing is looked up from the working folder, where Oxfmt and the parser run.
+  const lone = path.join(root, 'lone', 'oxfmt');
+  fs.mkdirSync(path.dirname(lone));
+  fs.writeFileSync(lone, markdownFormatter, { mode: 0o755 });
+  fs.mkdirSync(path.join(root, 'dist'));
+  fs.writeFileSync(path.join(root, 'dist', 'markdown-Trap.js'), `require('node:fs').writeFileSync(${JSON.stringify(loaded)}, '');`);
+  const cwd = process.cwd();
+  process.chdir(root);
+  t.after(() => process.chdir(cwd));
+  assert.equal(await format('```py\nx=1\n```\n', file, { oxfmtPath: lone }), '```py\nx=1\n```\n');
+  assert.equal(fs.existsSync(loaded), false);
+});
+
+test('a cancelled save also ends looking up the parser through mise', async t => {
+  const root = repo(t, 'project-formatter-cancel-lookup-');
+  codeBlockTools(t, root);
+  const pids = path.join(root, 'pids');
+  // `oxfmt` on the PATH is a mise shim, and `mise which` hangs.
+  const mise = path.join(root, 'bin', 'mise');
+  fs.writeFileSync(mise, `#!/usr/bin/env node
+if (process.argv[2] === 'which') { require('node:fs').writeFileSync(${JSON.stringify(pids)}, String(process.pid)); setTimeout(() => {}, 30000); }
+else { let text = ''; process.stdin.on('data', data => text += data).on('end', () => process.stdout.write(text)); }
+`, { mode: 0o755 });
+  fs.symlinkSync(mise, path.join(root, 'bin', 'oxfmt'));
+  const abort = new AbortController();
+  const formatting = format('```py\nx=1\n```\n', path.join(root, 'a.md'), {}, abort.signal);
+  const wait = () => new Promise(resolve => setTimeout(resolve, 10));
+  while (!(fs.existsSync(pids) && fs.readFileSync(pids, 'utf8'))) await wait();
+  const aborted = Date.now();
+  abort.abort();
+  await assert.rejects(formatting, /aborted/);
+  // At once, not after the 15 second timeout.
+  assert.ok(Date.now() - aborted < 5000, `${Date.now() - aborted} ms`);
+  const alive = pid => { try { return process.kill(pid, 0); } catch { return false; } };
+  const lookup = Number(fs.readFileSync(pids, 'utf8'));
+  for (let tries = 0; alive(lookup) && tries < 200; tries++) await wait();
+  assert.equal(alive(lookup), false);
 });
 
 // Fails when an update of Oxfmt, Ruff or CSharpier changes its output or how it reports a block it cannot format.

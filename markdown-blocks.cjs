@@ -1,5 +1,5 @@
-// Prints the code blocks of the Markdown on stdin as JSON, found by the Markdown parser in the module argv[2]: Prettier's
-// plugin, or the copy Oxfmt bundles. A process of its own, so an updated formatter's parser is the one loaded.
+// Prints the code blocks of the Markdown on stdin as JSON, found by the parser named argv[3] in the module argv[2]: Prettier's
+// Markdown plugin, or the copy Oxfmt bundles. A process of its own, so an updated formatter's parser is the one loaded.
 const { pathToFileURL } = require('node:url');
 
 // As in Prettier: `<!-- prettier-ignore -->` keeps the next node as it is, `-start` and `-end` everything between them.
@@ -7,8 +7,9 @@ const ignoreComment = /^<!--\s*prettier-ignore(?:-(start|end))?\s*-->$/;
 
 (async () => {
   const module = await import(pathToFileURL(process.argv[2]).href);
-  const parser = module.parsers?.markdown ?? module.default?.parsers?.markdown;
-  if (typeof parser?.parse !== 'function') throw new Error(`${process.argv[2]} has no Markdown parser.`);
+  const name = process.argv[3];
+  const parser = module.parsers?.[name] ?? module.default?.parsers?.[name];
+  if (typeof parser?.parse !== 'function') throw new Error(`${process.argv[2]} has no ${name} parser.`);
   let text = '';
   process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) text += chunk;
