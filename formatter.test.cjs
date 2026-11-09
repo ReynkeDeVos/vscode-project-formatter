@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { detect, documentPath, invocation, format, oxcPath, stopPrettier } = require('./formatter.cjs');
+const { detect, documentPath, invocation, format, oxcPath, oxcRules, stopPrettier } = require('./formatter.cjs');
 
 // A throwaway repository root, so detection stops there instead of walking into the real temp directory.
 function repo(t, prefix) {
@@ -150,7 +150,7 @@ test('monorepo packages, Biome and dprint programs, and oxc.path settings', t =>
   fs.renameSync(path.join(app, 'dprint.json'), path.join(app, '.oxfmtrc.json'));
   fs.writeFileSync(path.join(bin, 'oxfmt'), '');
   assert.equal(invocation(file).executable, path.join(bin, 'oxfmt'));
-  assert.equal(invocation(file, '/opt/oxfmt').executable, '/opt/oxfmt');
+  assert.equal(invocation(file, { oxfmtPath: '/opt/oxfmt' }).executable, '/opt/oxfmt');
   process.env.PROJECT_FORMATTER_TEST = '/env';
   t.after(() => delete process.env.PROJECT_FORMATTER_TEST);
   assert.equal(oxcPath('${env:PROJECT_FORMATTER_TEST}/oxfmt', root), '/env/oxfmt');
@@ -188,7 +188,7 @@ test('Prettier 3 stays loaded per project, restarts when its config changes and 
   await assert.rejects(format('empty', file), /empty output/);
   const abort = new AbortController();
   abort.abort();
-  await assert.rejects(format('x', file, undefined, undefined, abort.signal), /aborted/);
+  await assert.rejects(format('x', file, undefined, abort.signal), /aborted/);
   fs.writeFileSync(config, 'module.exports = { prefix: "b" };');
   fs.utimesSync(config, new Date(), new Date(Date.now() + 1000));
   const second = await format('x', file);
@@ -208,12 +208,95 @@ test('Prettier 3 stays loaded per project, restarts when its config changes and 
 
 test('documents without a file of their own keep their location and name their syntax', () => {
   const doc = (scheme, fileName, languageId) => ({ uri: { scheme }, fileName, languageId });
-  assert.equal(documentPath(doc('file', '/p/tsconfig.json', 'jsonc'), '/root'), '/p/tsconfig.json');
-  assert.equal(documentPath(doc('vscode-userdata', '/u/settings.json', 'jsonc'), '/root'), '/u/settings.json.jsonc');
-  assert.equal(documentPath(doc('vscode-userdata', '/u/mcp.jsonc', 'jsonc'), '/root'), '/u/mcp.jsonc');
-  assert.equal(documentPath(doc('untitled', 'Untitled-1', 'typescript'), '/root'), '/root/Untitled-1.ts');
-  assert.equal(documentPath(doc('untitled', 'Untitled-1', 'markdown'), undefined), path.join(os.homedir(), 'Untitled-1.md'));
-  assert.equal(documentPath(doc('vscode-notebook-cell', '/p/a.ipynb', 'markdown'), '/root'), '/p/a.ipynb.md');
+  // In the order VS Code lists them: another extension adds to jsonc before its own contribution.
+  const languages = [
+    { id: 'jsonc', extensions: ['.code-workspace'] },
+    { id: 'jsonc', filenames: ['.eslintrc.json'] },
+    { id: 'jsonc', extensions: ['.jsonc', '.eslintrc'] },
+    { id: 'javascript', extensions: ['.pac', '.js'] },
+    { id: 'typescript', extensions: ['.ts', '.cts'] },
+    { id: 'json', extensions: ['.json', '.ipynb'] },
+    { id: 'markdown', extensions: ['.md', '.markdown', '.mdtext'] },
+    { id: 'future', extensions: ['.ftr'] },
+  ];
+  const place = (document, root) => documentPath(document, root, languages, ['code-workspace', 'jsonc', 'json', 'cts', 'ts', 'js', 'md', 'markdown']);
+  assert.equal(place(doc('file', '/p/tsconfig.json', 'jsonc'), '/root'), '/p/tsconfig.json');
+  assert.equal(place(doc('vscode-userdata', '/u/settings.json', 'jsonc'), '/root'), '/u/settings.json.jsonc');
+  assert.equal(place(doc('vscode-userdata', '/u/mcp.jsonc', 'jsonc'), '/root'), '/u/mcp.jsonc');
+  assert.equal(place(doc('untitled', 'Untitled-1', 'typescript'), '/root'), '/root/Untitled-1.ts');
+  assert.equal(place(doc('untitled', 'Untitled-1', 'javascript'), '/root'), '/root/Untitled-1.js');
+  assert.equal(place(doc('untitled', 'Untitled-1', 'markdown'), undefined), path.join(os.homedir(), 'Untitled-1.md'));
+  assert.equal(place(doc('vscode-notebook-cell', '/p/a.ipynb', 'markdown'), '/root'), '/p/a.ipynb.md');
+  // A name that already fits stays, so config overrides for it still apply.
+  assert.equal(place(doc('untitled', '/p/new.md', 'markdown'), '/root'), '/p/new.md');
+  assert.equal(place(doc('untitled', '/p/new.markdown', 'markdown'), '/root'), '/p/new.markdown');
+  // A name Oxfmt cannot read gets one it can.
+  assert.equal(place(doc('vscode-notebook-cell', '/p/a.ipynb', 'json'), '/root'), '/p/a.ipynb.json');
+  assert.equal(place(doc('untitled', '/p/x.mdtext', 'markdown'), '/root'), '/p/x.mdtext.md');
+  // A language Oxc adds later works without a change here, and one nothing contributes stays as named.
+  assert.equal(place(doc('untitled', 'Untitled-1', 'future'), '/root'), '/root/Untitled-1.ftr');
+  assert.equal(place(doc('untitled', 'Untitled-1', 'unknown'), '/root'), '/root/Untitled-1');
+});
+
+test('the Oxc rules come from its installed copy', t => {
+  const root = repo(t, 'project-formatter-oxc-rules-');
+  fs.mkdirSync(path.join(root, 'out'));
+  const packageJSON = { main: './out/main.js', activationEvents: ['onLanguage:json', 'onCommand:x', 'onLanguage:yaml'] };
+  const rules = bundle => {
+    fs.writeFileSync(path.join(root, 'out', 'main.js'), bundle);
+    return oxcRules({ extensionPath: root, packageJSON });
+  };
+  const languages = [{ language: 'json' }, { language: 'yaml' }];
+  const selector = '{this.documentSelectors=[{pattern:`**/*.{${yi.join(`,`)}}`,scheme:`file`},...$b.map(e=>({pattern:`**/${e}`,scheme:`file`})),...xi.map(e=>({language:e}))]}';
+  // Both minified list forms.
+  const found = rules(`const yi=/* @__PURE__ */ \`ts,json.example\`.split(\`,\`),$b=[\`README\`,\`.babelrc\`];class S${selector}`);
+  assert.deepEqual(found.extensions, ['ts', 'json.example']);
+  assert.deepEqual(found.selector, [
+    { pattern: '**/*.{ts,json.example}', scheme: 'file' },
+    { pattern: '**/README', scheme: 'file' },
+    { pattern: '**/.babelrc', scheme: 'file' },
+    ...languages,
+  ]);
+  // A bundle of another shape, or none, or a name used for two lists, leaves only the languages.
+  for (const shadowed of ['yi', '$b']) {
+    assert.deepEqual(rules(`function f(){const ${shadowed}=[\`other\`]}const yi=[\`ts\`],$b=[\`README\`];class S${selector}`), { extensions: [], selector: languages });
+  }
+  assert.deepEqual(rules('this.documentSelectors=somethingElse'), { extensions: [], selector: languages });
+  assert.deepEqual(rules(`class S${selector}`), { extensions: [], selector: languages });
+  fs.rmSync(path.join(root, 'out', 'main.js'));
+  assert.deepEqual(oxcRules({ extensionPath: root, packageJSON }), { extensions: [], selector: languages });
+});
+
+// Fails when an Oxc update changes its bundle's shape, and on a machine without Oxc there is nothing to read.
+const extensionsDir = path.join(os.homedir(), '.vscode', 'extensions');
+const installedOxc = fs.existsSync(extensionsDir) && fs.readdirSync(extensionsDir).filter(name => name.startsWith('oxc.oxc-vscode-')).sort().at(-1);
+test('the installed Oxc extension can still be read', { skip: !installedOxc }, () => {
+  const extensionPath = path.join(extensionsDir, installedOxc);
+  const { extensions, selector } = oxcRules({ extensionPath, packageJSON: JSON.parse(fs.readFileSync(path.join(extensionPath, 'package.json'), 'utf8')) });
+  assert.ok(extensions.includes('ts') && extensions.includes('json'));
+  assert.ok(selector.some(({ pattern }) => pattern === '**/.prettierrc'));
+  assert.ok(selector.some(({ language }) => language === 'jsonc'));
+  assert.ok(!selector.some(({ pattern }) => pattern === '**/.eslintrc'));
+});
+
+test('Oxfmt runs with the Oxc settings from the workspace folder, other formatters as before', t => {
+  const root = repo(t, 'project-formatter-oxfmt-settings-');
+  const file = path.join(root, 'a.ts');
+  const oxc = { oxfmtPath: '/opt/oxfmt', configPath: '/c/custom.json', disableNestedConfig: true, folder: '/workspace' };
+  const flags = ['--config=/c/custom.json', '--disable-nested-config', '--stdin-filepath', file];
+  const command = invocation(file, oxc);
+  assert.equal(command.cwd, '/workspace');
+  assert.deepEqual(command.args, flags);
+  assert.deepEqual(invocation(file).args, ['--stdin-filepath', file]);
+  assert.equal(invocation(file).cwd, root);
+  fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
+  const prettier = invocation(file, oxc);
+  assert.equal(prettier.cwd, root);
+  assert.deepEqual(prettier.args, ['--stdin-filepath', file]);
+  // The hand-over from Prettier counts as Oxfmt too.
+  const fallback = invocation(file, oxc, { tool: 'oxfmt', cwd: root, reason: 'Prettier has no parser for this file' });
+  assert.equal(fallback.cwd, '/workspace');
+  assert.deepEqual(fallback.args, flags);
 });
 
 test('Oxfmt takes file types Prettier cannot parse and skips names it does not know', async t => {
@@ -226,10 +309,10 @@ test('Oxfmt takes file types Prettier cannot parse and skips names it does not k
   fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
   fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
   script('node_modules/.bin/prettier', 'console.error("[error] No parser could be inferred for file \\"a.toml\\"."); process.exitCode = 2;');
-  const oxfmt = script('oxfmt', 'console.log("from oxfmt");');
+  const oxfmt = { oxfmtPath: script('oxfmt', 'console.log("from oxfmt");') };
   const file = path.join(root, 'a.toml');
   const log = [];
-  assert.equal(await format('a=1\n', file, oxfmt, undefined, undefined, message => log.push(message)), 'from oxfmt\n');
+  assert.equal(await format('a=1\n', file, oxfmt, undefined, message => log.push(message)), 'from oxfmt\n');
   assert.ok(log.some(message => message.includes('oxfmt (Prettier has no parser for this file)')));
   script('oxfmt', 'console.error("Unsupported file type for stdin-filepath"); process.exitCode = 1;');
   assert.equal(await format('a=1\n', file, oxfmt), 'a=1\n');
@@ -271,8 +354,8 @@ test('the kept-loaded Prettier also hands file types it cannot parse to Oxfmt', 
       throw new Error('Unexpected token (1:1)\\n> 1 | No parser could be inferred for file "x"\\n    | ^');
     };
   `);
-  const oxfmt = path.join(root, 'oxfmt');
-  fs.writeFileSync(oxfmt, '#!/usr/bin/env node\nconsole.log("from oxfmt");\n', { mode: 0o755 });
+  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
+  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nconsole.log("from oxfmt");\n', { mode: 0o755 });
   assert.equal(await format('a=1\n', path.join(root, 'a.toml'), oxfmt), 'from oxfmt\n');
   await assert.rejects(format('a=1\n', path.join(root, 'a.js'), oxfmt), /prettier: Unexpected token/);
 });
