@@ -155,7 +155,7 @@ function invocation(file, oxc = {}, selection = detect(file)) {
   const executable = (isOxfmt && oxc.oxfmtPath) || (local && nativeProgram(selection.tool, local)) || local || selection.tool;
   // Also as there: its settings apply, and it runs from the workspace folder, the one place it reads ignore files from.
   const flags = isOxfmt ? [...(oxc.configPath ? [`--config=${oxc.configPath}`] : []), ...(oxc.disableNestedConfig ? ['--disable-nested-config'] : [])] : [];
-  // Only Prettier 3 ships index.cjs; older Prettier runs through the CLI. A global Prettier 3 is found when it runs (see run).
+  // Only Prettier 3 ships index.cjs; older and global Prettier run through the CLI, as mise or the PATH runs them.
   const prettier = selection.tool === 'prettier' && local && path.join(path.dirname(local), '..', 'prettier', 'index.cjs');
   return { ...selection, cwd: (isOxfmt && oxc.folder) || selection.cwd, executable, args: [...flags, ...tools[selection.tool].args, file],
     prettier: prettier && fs.existsSync(prettier) ? prettier : undefined };
@@ -273,11 +273,6 @@ function execute(executable, args, input, { cwd, env, signal }) {
 }
 
 async function run(command, input, file, env, signal, log) {
-  // A global Prettier 3 stays loaded too: its package, found as for the Markdown parser, has the same index.cjs.
-  if (command.tool === 'prettier' && !command.prettier) {
-    const root = await packageOf('prettier', command.executable, command.cwd, env, signal);
-    if (root && fs.existsSync(path.join(root, 'index.cjs'))) command.prettier = path.join(root, 'index.cjs');
-  }
   log(`${file}: ${command.tool} (${command.reason})${command.prettier ? ', kept loaded' : ''}`);
   if (command.tool === 'bun') {
     const { stdout } = await promisify(execFile)(command.executable, ['--help'], { cwd: command.cwd, env, encoding: 'utf8', timeout: 5000, signal });
@@ -344,9 +339,11 @@ async function markdownParser(command, file, env, signal) {
     return chunks.length === 1 ? { module: path.join(root, 'dist', chunks[0]), parser: 'markdown' } : { reason: "no Markdown parser found in oxfmt's package" };
   }
   if (command.tool !== 'prettier') return { reason: `${command.tool} has no Markdown parser to find them with` };
-  // Prettier 3 runs kept loaded, local or global; Prettier 2 runs as a CLI and loads plugins by itself.
-  const module = command.prettier && path.join(path.dirname(command.prettier), 'plugins', 'markdown.js');
-  if (!module || !fs.existsSync(module)) return { reason: "no Markdown parser of Prettier 3 found in prettier's package (Prettier 2 loads plugins by itself)" };
+  // Only the kept-loaded Prettier 3 reports the parser it formatted with in the same call. A global Prettier or Prettier 2 runs
+  // as a CLI, and a second call could read another config, or the same one with another environment, as mise sets it.
+  if (!command.prettier) return { reason: 'prettier runs as a CLI here (a global Prettier, or Prettier 2), which does not report how it parsed the file' };
+  const module = path.join(path.dirname(command.prettier), 'plugins', 'markdown.js');
+  if (!fs.existsSync(module)) return { reason: "no Markdown parser found in prettier's package" };
   // The parser Prettier formatted the file with, from a config's overrides too, and its plugins, which can replace any parser,
   // as it reported them with that very result: from the config it used, which may be older than the files on disk.
   const info = command.reported ?? {};

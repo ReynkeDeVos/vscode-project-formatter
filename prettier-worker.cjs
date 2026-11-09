@@ -4,6 +4,9 @@
 process.on('message', async ({ id, text, file }) => {
   try {
     const prettier = require(process.argv[2]);
+    // Config files are read afresh on every save, as by the CLI, nested .editorconfig files too; only JavaScript configs stay
+    // cached by Node, so a change to one restarts this process.
+    await prettier.clearConfigCache?.();
     const { ignored, inferredParser } = await prettier.getFileInfo(file, { ignorePath: ['.gitignore', '.prettierignore'] });
     if (ignored) return process.send({ id, formatted: text });
     const options = await prettier.resolveConfig(file, { editorconfig: true });

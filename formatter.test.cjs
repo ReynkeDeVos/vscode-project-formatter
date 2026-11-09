@@ -567,23 +567,20 @@ test('the Markdown parser is the one of the formatter that ran', async t => {
   fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
   fakePrettier(path.join(root, 'node_modules'));
   assert.equal(await run(), formatted);
-  // A global Prettier 3 on the PATH, kept loaded from its package, which reports how it parsed the file with its result.
+  // A global Prettier runs as a CLI, as mise or the PATH runs it, which does not report how it parsed the file: its blocks stay.
   stopPrettier();
   fs.rmSync(path.join(root, 'node_modules'), { recursive: true });
   fakePrettier(path.join(root, 'global', 'node_modules'));
   process.env.PATH = [path.join(root, 'global', 'node_modules', '.bin'), process.env.PATH].join(path.delimiter);
   log.length = 0;
-  assert.equal(await run(), formatted);
-  assert.ok(log.some(message => message.endsWith('prettier (.prettierrc), kept loaded')), log.join('\n'));
-  // A shim script in `node_modules/.bin`, as pnpm and aube write them, that runs the package next to it.
-  fs.rmSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'));
-  fs.writeFileSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'), `#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/../prettier/bin/prettier.cjs" "$@"\n`, { mode: 0o755 });
-  assert.equal(await run(), formatted);
-  // Prettier 2 loads plugins by itself, so its blocks stay.
-  fs.renameSync(path.join(root, 'global', 'node_modules', 'prettier', 'plugins', 'markdown.js'), path.join(root, 'global', 'node_modules', 'prettier', 'parser-markdown.js'));
-  log.length = 0;
   assert.equal(await run(), '```py\nx=1\n```\n');
-  assert.ok(log.some(message => message.includes('Prettier 2 loads plugins by itself')), log.join('\n'));
+  assert.ok(log.some(message => message.endsWith('prettier (.prettierrc)')), log.join('\n'));
+  assert.ok(log.some(message => message.includes('prettier runs as a CLI here')), log.join('\n'));
+  // Oxfmt through a shim script in `node_modules/.bin`, as pnpm and aube write them, that runs the package next to it.
+  fs.rmSync(path.join(root, '.prettierrc'));
+  fs.rmSync(path.join(root, 'tools', 'node_modules', '.bin', 'oxfmt'));
+  fs.writeFileSync(path.join(root, 'tools', 'node_modules', '.bin', 'oxfmt'), `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/../oxfmt/bin/oxfmt" "$@"\n`, { mode: 0o755 });
+  assert.equal(await run({ oxfmtPath: path.join(root, 'tools', 'node_modules', '.bin', 'oxfmt') }), formatted);
 });
 
 const shims = path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims');
@@ -649,6 +646,17 @@ test('Prettier: only a file it prints as Markdown, as its config, pragmas and ig
   config('.prettierrc', '{}');
   config('.prettierignore', 'a.md\n');
   assert.equal(await run(block), block);
+  // A nested .editorconfig is read afresh on every save, though no restart watches it.
+  fs.rmSync(path.join(root, '.prettierignore'));
+  config('.prettierrc', '{ "proseWrap": "always" }');
+  fs.mkdirSync(path.join(root, 'docs'));
+  fs.writeFileSync(path.join(root, 'docs', '.editorconfig'), '[*.md]\nmax_line_length = 20\n');
+  const prose = 'one two three four five six seven eight nine ten\n';
+  const docs = path.join(root, 'docs', 'a.md');
+  assert.equal((await format(prose, docs)).split('\n').length, 4);
+  fs.writeFileSync(path.join(root, 'docs', '.editorconfig'), '[*.md]\nmax_line_length = 80\n');
+  assert.equal(await format(prose, docs), prose);
+  config('.prettierignore', 'a.md\n');
   // A config that imports another file: the kept-loaded Prettier keeps what it read until its own config files change, and the
   // blocks follow what it formatted with, not the newer file on disk.
   fs.rmSync(path.join(root, '.prettierignore'));

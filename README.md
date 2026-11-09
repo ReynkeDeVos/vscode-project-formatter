@@ -1,17 +1,37 @@
 # Project Formatter
 
-Automatically chooses your project's **Prettier, Oxfmt, Bun fmt, Biome or dprint**. Falls back to Oxfmt. Leaves linting alone.
+One default formatter for VS Code that formats every file the way its project does.
 
-Needs the [Oxc extension](https://marketplace.visualstudio.com/items?itemName=oxc.oxc-vscode), whose rules it follows.
+- **Your project's formatter.** Prettier, Oxfmt, Biome, dprint or Bun fmt, whichever the project uses. Otherwise Oxfmt.
+- **Code in Markdown too.** Python blocks with Ruff, C# blocks with CSharpier. Only real code blocks, as your Markdown formatter sees them.
+- **Fast saves.** A project's Prettier stays loaded; Biome and dprint run natively.
+- **Follows Oxc.** Formats the files the [Oxc extension](https://marketplace.visualstudio.com/items?itemName=oxc.oxc-vscode) formats, with its Oxfmt settings.
 
-1. Download the `.vsix` from [Releases](https://github.com/ReynkeDeVos/vscode-project-formatter/releases/latest) and install it with **Extensions: Install from VSIX…**.
-2. Make it your default formatter with `"editor.defaultFormatter": "kawa.project-formatter"`. It handles the documents the installed Oxc extension handles, read from it at startup, so an Oxc update needs no change here. Give every other language with a formatter its own block, such as `"[python]": { "editor.defaultFormatter": "charliermarsh.ruff" }`.
-3. Enable **Editor: Format On Save**.
+## Setup
 
-Searches from the file up to the repository root; the nearest folder that declares a formatter wins. Within a folder: a `format`/`fmt` script, `bunfig.toml` `[fmt]`, Oxfmt config, Biome config, dprint config, Prettier config, then dependencies. Uses `oxc.path.oxfmt` if set, then local binaries, then global tools; `oxc.path.node` selects Node.js for all of them. Oxfmt runs as under the Oxc extension: from the workspace folder, the one place it reads ignore files from, and with `oxc.fmt.configPath` and `oxc.fmt.disableNestedConfig`. Prettier 3, local or global, stays loaded in one background process per project, so saves skip its startup; it restarts when a config or ignore file changes and exits after 15 minutes unused. Local Biome and dprint run their native program directly instead of through the npm launcher. Each formatter reads the project's own config, as on the command line. File types the project's Prettier has no parser for, like TOML, go to Oxfmt. Install the formatters yourself.
+1. Install the Oxc extension, then the `.vsix` from [Releases](https://github.com/ReynkeDeVos/vscode-project-formatter/releases/latest) with **Extensions: Install from VSIX…**.
+2. Add to your settings:
 
-Markdown formatters leave Python and C# code blocks alone, so in Markdown files Ruff then formats the Python blocks and CSharpier the C# blocks (under dprint, its own plugins do). The blocks are found with the Markdown parser of the formatter that ran, so both agree on what is code, also after either updates: Oxfmt's copy of Prettier's plugin in its package, or the plugin of the kept-loaded Prettier 3, which reports the parser and plugins it formatted the file with. The parser is loaded only from the package that declares the formatter's executable as its command, or whose `node_modules/.bin` shim runs it. Fences in front matter, HTML, math or indented code examples stay text, and blocks in lists and blockquotes keep their indentation and `>`. Ruff gets each block on its own, CSharpier all C# blocks of a file at once, since it starts .NET on every run; both read the config of the document's folder. Blocks stay as they are when the formatter does not print the file as Markdown (an ignore file or pattern, a pragma, or a Prettier config giving Markdown files another parser, MDX included), when Prettier has plugins for the file or is Prettier 2, which load their own parsers, under a `<!-- prettier-ignore -->` comment, when they are not valid code on their own (like a C# method without its class, listed in the **Project Formatter** output), and when their formatted code would change the Markdown around them, which the parser checks on the result. Ruff and CSharpier come from the `PATH` or mise; without them, or without a parser to find the blocks with, the blocks stay as they are. A cancelled save or the 15 second timeout ends every formatter run as its own process, and what it started, with SIGKILL after 2 seconds if needed; the kept-loaded Prettier finishes the file it is formatting.
+   ```jsonc
+   "editor.defaultFormatter": "kawa.project-formatter",
+   "editor.formatOnSave": true,
+   // Languages Oxc does not format keep their own formatter:
+   "[python]": { "editor.defaultFormatter": "charliermarsh.ruff" }
+   ```
 
-Linux/macOS. Documents without a file of their own (settings.json, untitled, notebook cells) use the formatter of their location or the workspace root. Custom script wrappers/flags aren't interpreted. Bun needs native `bun fmt` and no overriding `fmt` script.
+3. Install the formatters you use, in the project or globally (mise works). For code in Markdown: Ruff and CSharpier.
 
-Test: `npm ci && npm test`. Package: `npx @vscode/vsce package`.
+If something stays unformatted, the **Project Formatter** output says why.
+
+<details>
+<summary>How it decides</summary>
+
+- The nearest folder from the file up to the repository root that declares a formatter wins: a `format`/`fmt` script, `bunfig.toml` `[fmt]`, an Oxfmt, Biome, dprint or Prettier config, then a dependency. File types the project's Prettier cannot parse, like TOML, go to Oxfmt.
+- Oxfmt runs as under the Oxc extension, with `oxc.path.oxfmt`, `oxc.fmt.configPath` and `oxc.fmt.disableNestedConfig`; `oxc.path.node` picks Node.js for every formatter.
+- Markdown code blocks are found with the Markdown parser of the formatter that ran, so both stay in agreement after updates. They stay as they are in an ignored file, under `<!-- prettier-ignore -->`, with Prettier plugins or a non-Markdown parser, with a global Prettier or Prettier 2, when the code is not valid on its own (a C# method without its class), or when formatting it would change the Markdown around it. Under dprint, its own plugins format code blocks.
+- A cancelled save or the 15 second timeout ends the formatter processes the save started.
+- Linux and macOS. Bun needs a native `bun fmt` and no `fmt` script of its own.
+
+</details>
+
+Develop with `npm ci && npm test`; package with `npx @vscode/vsce package`.
