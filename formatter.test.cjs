@@ -407,17 +407,35 @@ else {
 }
 `;
 
-// That formatter as Oxfmt, in a package with a Markdown chunk shaped like Oxfmt's, made of the Prettier in node_modules.
+// That formatter as Oxfmt, in a package laid out as npm installs it: its own command file, linked into `node_modules/.bin`, and a
+// Markdown chunk shaped like Oxfmt's, made of the Prettier in node_modules.
 function fakeOxfmt(root) {
   const modules = path.join(root, 'tools', 'node_modules');
   const plugin = path.join(path.dirname(require.resolve('prettier/package.json')), 'plugins', 'markdown.mjs');
   fs.mkdirSync(path.join(modules, 'oxfmt', 'dist'), { recursive: true });
+  fs.mkdirSync(path.join(modules, 'oxfmt', 'bin'));
   fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
-  fs.writeFileSync(path.join(modules, 'oxfmt', 'package.json'), '{"name": "oxfmt", "type": "module"}');
+  fs.writeFileSync(path.join(modules, 'oxfmt', 'package.json'), '{"name": "oxfmt", "type": "module", "bin": {"oxfmt": "bin/oxfmt"}}');
   fs.writeFileSync(path.join(modules, 'oxfmt', 'dist', 'markdown-Ab12_c.js'), `export { parsers } from ${JSON.stringify(pathToFileURL(plugin).href)};\n`);
+  fs.writeFileSync(path.join(modules, 'oxfmt', 'bin', 'oxfmt'), markdownFormatter, { mode: 0o755 });
   const bin = path.join(modules, '.bin', 'oxfmt');
-  fs.writeFileSync(bin, markdownFormatter, { mode: 0o755 });
+  fs.symlinkSync(path.join('..', 'oxfmt', 'bin', 'oxfmt'), bin);
   return bin;
+}
+
+// A fake Prettier 3 package in `node_modules`: its API, its command linked into `.bin`, and this repository's Markdown plugin.
+function fakePrettier(modules) {
+  const prettier = path.join(modules, 'prettier');
+  fs.mkdirSync(path.join(prettier, 'plugins'), { recursive: true });
+  fs.mkdirSync(path.join(prettier, 'bin'));
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.writeFileSync(path.join(prettier, 'package.json'), '{"name": "prettier", "main": "index.cjs", "bin": "./bin/prettier.cjs"}');
+  fs.writeFileSync(path.join(prettier, 'index.cjs'), `exports.getFileInfo = async () => ({ ignored: false, inferredParser: 'markdown' });
+exports.resolveConfig = async () => ({});
+exports.format = async text => text.replace(/^#  /gm, '# ');`);
+  fs.writeFileSync(path.join(prettier, 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
+  fs.writeFileSync(path.join(prettier, 'bin', 'prettier.cjs'), markdownFormatter, { mode: 0o755 });
+  fs.symlinkSync(path.join('..', 'prettier', 'bin', 'prettier.cjs'), path.join(modules, '.bin', 'prettier'));
 }
 
 test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks the parser finds', async t => {
@@ -538,32 +556,31 @@ test('the Markdown parser is the one of the formatter that ran', async t => {
   // Oxfmt on the PATH through a mise shim.
   const bin = fakeOxfmt(root);
   const mise = path.join(root, 'bin', 'mise');
-  fs.writeFileSync(mise, `#!/usr/bin/env node\nif (process.argv[2] === 'which') console.log(${JSON.stringify(bin)}); else require(${JSON.stringify(bin)});\n`, { mode: 0o755 });
+  fs.writeFileSync(mise, markdownFormatter.replace('if (', `if (process.argv[2] === 'which') console.log(${JSON.stringify(bin)});\nelse if (`), { mode: 0o755 });
   fs.symlinkSync(mise, path.join(root, 'bin', 'oxfmt'));
   assert.equal(await run(), formatted);
   // The project's Prettier 3, kept loaded, with its plugin.
   t.after(stopPrettier);
   fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
-  const prettier = path.join(root, 'node_modules', 'prettier');
-  fs.mkdirSync(path.join(prettier, 'plugins'), { recursive: true });
-  fs.mkdirSync(path.join(root, 'node_modules', '.bin'));
-  fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'prettier'), markdownFormatter, { mode: 0o755 });
-  fs.writeFileSync(path.join(prettier, 'index.cjs'), 'exports.getFileInfo = async () => ({ ignored: false }); exports.resolveConfig = async () => ({}); exports.format = async text => text.replace(/^#  /gm, \'# \');');
-  fs.writeFileSync(path.join(prettier, 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
+  fakePrettier(path.join(root, 'node_modules'));
   assert.equal(await run(), formatted);
-  // A global Prettier on the PATH, next to its package.
+  // A global Prettier on the PATH, run through its package's command.
   stopPrettier();
   fs.rmSync(path.join(root, 'node_modules'), { recursive: true });
-  const global = path.join(root, 'global', 'node_modules');
-  fs.mkdirSync(path.join(global, 'prettier', 'plugins'), { recursive: true });
-  fs.mkdirSync(path.join(global, '.bin'));
-  fs.writeFileSync(path.join(global, 'prettier', 'package.json'), '{"name": "prettier"}');
-  fs.writeFileSync(path.join(global, 'prettier', 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
-  fs.writeFileSync(path.join(global, '.bin', 'prettier'), markdownFormatter, { mode: 0o755 });
-  process.env.PATH = [path.join(global, '.bin'), process.env.PATH].join(path.delimiter);
+  fakePrettier(path.join(root, 'global', 'node_modules'));
+  process.env.PATH = [path.join(root, 'global', 'node_modules', '.bin'), process.env.PATH].join(path.delimiter);
   log.length = 0;
   assert.equal(await run(), formatted);
   assert.ok(log.some(message => message.endsWith('prettier (.prettierrc)')), log.join('\n'));
+  // A shim script in `node_modules/.bin`, as pnpm and aube write them, that runs the package next to it.
+  fs.rmSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'));
+  fs.writeFileSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'), `#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/../prettier/bin/prettier.cjs" "$@"\n`, { mode: 0o755 });
+  assert.equal(await run(), formatted);
+  // Prettier 2 loads plugins by itself, so its blocks stay.
+  fs.renameSync(path.join(root, 'global', 'node_modules', 'prettier', 'plugins', 'markdown.js'), path.join(root, 'global', 'node_modules', 'prettier', 'parser-markdown.js'));
+  log.length = 0;
+  assert.equal(await run(), '```py\nx=1\n```\n');
+  assert.ok(log.some(message => message.includes('Prettier 2 loads plugins by itself')), log.join('\n'));
 });
 
 const shims = path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims');
@@ -616,6 +633,10 @@ test('Prettier: only a file it prints as Markdown, as its config, pragmas and ig
   assert.match(await run('const lesson=`\n~~~py\nx=1\n~~~\n`;\n'), /\nx=1\n/);
   config('.prettierrc', '{ "parser": "mdx" }');
   assert.match(await run('<Lesson text={`\n\n~~~py\nx=1\n~~~\n\n`} />\n'), /\nx=1\n/);
+  // A plugin can replace the Markdown parser itself, here with MDX's.
+  fs.writeFileSync(path.join(root, 'plugin.cjs'), "const markdown = require('prettier/plugins/markdown'); module.exports = { parsers: { markdown: markdown.parsers.mdx } };");
+  config('.prettierrc', '{ "plugins": ["./plugin.cjs"] }');
+  assert.match(await run('<Lesson text={`\n\n~~~py\nx=1\n~~~\n\n`} />\n'), /\nx=1\n/);
   // A pragma: the blocks of a file with the required one are formatted; an ignore pragma keeps them.
   config('.prettierrc', '{ "requirePragma": true }');
   assert.equal(await run(`<!-- @format -->\n\n${block}`), '<!-- @format -->\n\n```py\nx = 1\n```\n');
@@ -631,21 +652,45 @@ test('the parser comes only from the package the formatter runs from', async t =
   const root = repo(t, 'project-formatter-parser-trust-');
   codeBlockTools(t, root);
   const loaded = path.join(root, 'loaded');
-  const trap = dir => {
+  // A package named oxfmt whose Markdown chunk must never load.
+  const trap = (dir, manifest = '{"name": "oxfmt"}') => {
     fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'package.json'), '{"name": "oxfmt"}');
+    fs.writeFileSync(path.join(dir, 'package.json'), manifest);
     fs.writeFileSync(path.join(dir, 'dist', 'markdown-Trap.js'), `require('node:fs').writeFileSync(${JSON.stringify(loaded)}, '');`);
   };
+  const file = path.join(root, 'a.md');
+  const run = oxc => format('```py\nx=1\n```\n', file, oxc);
+  const own = fs.realpathSync(fakeOxfmt(root));
   // An Oxfmt linked from elsewhere: the package it runs from counts, not an `oxfmt` folder next to the link.
-  fakeOxfmt(root);
-  const own = path.join(root, 'tools', 'node_modules', 'oxfmt', 'bin', 'oxfmt');
-  fs.mkdirSync(path.dirname(own));
-  fs.writeFileSync(own, markdownFormatter, { mode: 0o755 });
   fs.mkdirSync(path.join(root, 'links', 'bin'), { recursive: true });
   fs.symlinkSync(own, path.join(root, 'links', 'bin', 'oxfmt'));
   trap(path.join(root, 'links', 'oxfmt'));
-  const file = path.join(root, 'a.md');
-  assert.equal(await format('```py\nx=1\n```\n', file, { oxfmtPath: path.join(root, 'links', 'bin', 'oxfmt') }), '```py\nx = 1\n```\n');
+  assert.equal(await run({ oxfmtPath: path.join(root, 'links', 'bin', 'oxfmt') }), '```py\nx = 1\n```\n');
+  // A file on the PATH that spawn skips, since it is not executable, is skipped here too.
+  fs.mkdirSync(path.join(root, 'shadow', 'bin'), { recursive: true });
+  trap(path.join(root, 'shadow'), '{"name": "oxfmt", "bin": {"oxfmt": "bin/oxfmt"}}');
+  fs.writeFileSync(path.join(root, 'shadow', 'bin', 'oxfmt'), markdownFormatter);
+  fs.mkdirSync(path.join(root, 'real'));
+  fs.symlinkSync(own, path.join(root, 'real', 'oxfmt'));
+  const { PATH } = process.env;
+  process.env.PATH = [path.join(root, 'shadow', 'bin'), path.join(root, 'real'), PATH].join(path.delimiter);
+  assert.equal(await run({}), '```py\nx = 1\n```\n');
+  process.env.PATH = PATH;
+  // A launcher inside a package named oxfmt that declares another file as its command, like a hard link into an unrelated folder.
+  fs.mkdirSync(path.join(root, 'unrelated', 'tools'), { recursive: true });
+  trap(path.join(root, 'unrelated'), '{"name": "oxfmt", "bin": {"oxfmt": "tools/other"}}');
+  fs.writeFileSync(path.join(root, 'unrelated', 'tools', 'other'), markdownFormatter, { mode: 0o755 });
+  fs.writeFileSync(path.join(root, 'launcher'), `#!/bin/sh\nexec ${JSON.stringify(own)} "$@"\n`, { mode: 0o755 });
+  fs.linkSync(path.join(root, 'launcher'), path.join(root, 'unrelated', 'tools', 'oxfmt'));
+  assert.equal(await run({ oxfmtPath: path.join(root, 'unrelated', 'tools', 'oxfmt') }), '```py\nx=1\n```\n');
+  // A shim in `node_modules/.bin` that runs another Oxfmt than the package next to it.
+  const shim = path.join(root, 'shimmed', 'node_modules', '.bin', 'oxfmt');
+  fs.mkdirSync(path.dirname(shim), { recursive: true });
+  trap(path.join(root, 'shimmed', 'node_modules', 'oxfmt'), '{"name": "oxfmt", "bin": {"oxfmt": "bin/oxfmt"}}');
+  fs.mkdirSync(path.join(root, 'shimmed', 'node_modules', 'oxfmt', 'bin'));
+  fs.writeFileSync(path.join(root, 'shimmed', 'node_modules', 'oxfmt', 'bin', 'oxfmt'), markdownFormatter, { mode: 0o755 });
+  fs.writeFileSync(shim, `#!/bin/sh\nexec ${JSON.stringify(own)} "$@"\n`, { mode: 0o755 });
+  assert.equal(await run({ oxfmtPath: shim }), '```py\nx=1\n```\n');
   // An Oxfmt in no package has no parser; nothing is looked up from the working folder, where Oxfmt and the parser run.
   const lone = path.join(root, 'lone', 'oxfmt');
   fs.mkdirSync(path.dirname(lone));
@@ -655,8 +700,32 @@ test('the parser comes only from the package the formatter runs from', async t =
   const cwd = process.cwd();
   process.chdir(root);
   t.after(() => process.chdir(cwd));
-  assert.equal(await format('```py\nx=1\n```\n', file, { oxfmtPath: lone }), '```py\nx=1\n```\n');
+  assert.equal(await run({ oxfmtPath: lone }), '```py\nx=1\n```\n');
   assert.equal(fs.existsSync(loaded), false);
+});
+
+test('a tool that ignores SIGTERM still ends with a cancelled save', async t => {
+  const root = repo(t, 'project-formatter-sigterm-');
+  const pids = path.join(root, 'pids');
+  const tool = path.join(root, 'tool');
+  fs.writeFileSync(tool, `#!/usr/bin/env node
+process.on('SIGTERM', () => {});
+require('node:fs').writeFileSync(${JSON.stringify(pids)}, String(process.pid));
+setTimeout(() => {}, 60000);
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(root, '.oxfmtrc.json'), '{}');
+  const abort = new AbortController();
+  const formatting = format('x\n', path.join(root, 'a.ts'), { oxfmtPath: tool }, abort.signal);
+  const wait = () => new Promise(resolve => setTimeout(resolve, 10));
+  while (!(fs.existsSync(pids) && fs.readFileSync(pids, 'utf8'))) await wait();
+  const aborted = Date.now();
+  abort.abort();
+  await assert.rejects(formatting, /aborted/);
+  assert.ok(Date.now() - aborted < 5000, `${Date.now() - aborted} ms`);
+  const alive = pid => { try { return process.kill(pid, 0); } catch { return false; } };
+  const pid = Number(fs.readFileSync(pids, 'utf8'));
+  for (let tries = 0; alive(pid) && tries < 200; tries++) await wait();
+  assert.equal(alive(pid), false);
 });
 
 test('a cancelled save also ends looking up the parser through mise', async t => {

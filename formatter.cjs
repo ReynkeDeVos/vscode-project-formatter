@@ -227,12 +227,29 @@ function execute(executable, args, input, { cwd, env, signal }) {
     if (signal?.aborted) return resolve({ error: signal.reason, stdout: '', stderr: '' });
     const output = { stdout: [], stderr: [] };
     let error;
+    let escalation;
     const child = spawn(executable, args, { cwd, env, detached: true });
+    const kill = name => { try { process.kill(-child.pid, name); } catch {} }; // Not started, or already ended.
+    const finish = (code, killedBy) => {
+      if (!timer) return;
+      clearTimeout(timer);
+      clearTimeout(escalation);
+      timer = undefined;
+      signal?.removeEventListener('abort', abort);
+      if (!error && (code || killedBy)) error = Object.assign(new Error(`exited with ${code ?? killedBy}`), { code });
+      resolve({ error, stdout: Buffer.concat(output.stdout).toString(), stderr: Buffer.concat(output.stderr).toString() });
+    };
+    // A program that ignores SIGTERM gets SIGKILL after 2 seconds; one that left the group and keeps the output open is not
+    // waited for a second longer.
     const stop = reason => {
       error ??= reason;
-      try { process.kill(-child.pid, 'SIGTERM'); } catch {} // Not started, or already ended.
+      kill('SIGTERM');
+      escalation ??= setTimeout(() => {
+        kill('SIGKILL');
+        escalation = setTimeout(finish, 1000);
+      }, 2000);
     };
-    const timer = setTimeout(() => stop(Object.assign(new Error('timed out after 15 seconds'), { killed: true })), 15000);
+    let timer = setTimeout(() => stop(Object.assign(new Error('timed out after 15 seconds'), { killed: true })), 15000);
     const abort = () => stop(signal.reason);
     signal?.addEventListener('abort', abort);
     // As execFile's maxBuffer: at most 16 MB on each stream.
@@ -244,12 +261,7 @@ function execute(executable, args, input, { cwd, env, signal }) {
       });
     }
     child.on('error', spawnError => { error ??= spawnError; });
-    child.on('close', (code, killedBy) => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', abort);
-      if (!error && (code || killedBy)) error = Object.assign(new Error(`exited with ${code ?? killedBy}`), { code });
-      resolve({ error, stdout: Buffer.concat(output.stdout).toString(), stderr: Buffer.concat(output.stderr).toString() });
-    });
+    child.on('close', finish);
     child.stdin.on('error', () => {}); // Process failures are reported by 'error' and 'close'.
     child.stdin.end(input);
   });
@@ -280,23 +292,34 @@ const languages = { python: ['python', 'py', 'python3', 'py3'], csharp: ['csharp
 // A fence that may hold Python or C#; only spares parsing a file without one.
 const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
 
-// The package an executable runs from: the nearest package.json above its real path, if named like the tool; else, for a shim
-// script in `node_modules/.bin` (pnpm, aube), the package next to it. Nothing else, so only code the formatter itself runs is
-// loaded. A bare name is looked up on the PATH, a mise shim through `mise which`.
+// The package a formatter's executable runs from, only with evidence that the formatter runs it: the executable is the file the
+// package declares as its command (npm links it into `node_modules/.bin`), or a shim in `node_modules/.bin` whose script names
+// that file (pnpm, aube). A bare name is looked up on the PATH as spawn looks it up, a mise shim through `mise which`.
 async function packageOf(tool, executable, cwd, env, signal) {
+  const runnable = file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
   let bin = path.isAbsolute(executable) ? executable
-    : env.PATH.split(path.delimiter).map(dir => path.join(dir, executable)).find(candidate => fs.existsSync(candidate));
+    : env.PATH.split(path.delimiter).filter(Boolean).map(dir => path.join(dir, executable)).find(runnable);
   if (bin && path.basename(fs.realpathSync(bin)) === 'mise') bin = (await execute('mise', ['which', tool], '', { cwd, env, signal })).stdout.trim();
   signal?.throwIfAborted();
-  if (!bin || !path.isAbsolute(bin) || !fs.existsSync(bin)) return;
-  const named = dir => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name === tool; } catch { return false; } };
+  if (!bin || !path.isAbsolute(bin) || !runnable(bin)) return;
+  // The command file a package named like the tool declares, as written and as it resolves.
+  const command = dir => {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      const file = pkg.name === tool && (typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.[tool]);
+      return file ? [path.join(dir, file), fs.realpathSync(path.join(dir, file))] : [];
+    } catch { return []; }
+  };
   const real = fs.realpathSync(bin);
   let dir = path.dirname(real);
   while (dir !== path.dirname(dir) && !fs.existsSync(path.join(dir, 'package.json'))) dir = path.dirname(dir);
-  if (named(dir)) return dir;
+  if (command(dir)[1] === real) return dir;
   const shims = path.dirname(real);
   const sibling = path.join(shims, '..', tool);
-  if (path.basename(shims) === '.bin' && path.basename(path.dirname(shims)) === 'node_modules' && named(sibling)) return fs.realpathSync(sibling);
+  const files = command(sibling);
+  if (path.basename(shims) !== '.bin' || path.basename(path.dirname(shims)) !== 'node_modules' || !files.length || fs.statSync(real).size > 65536) return;
+  const script = fs.readFileSync(real, 'utf8');
+  if (files.some(file => script.includes(path.relative(shims, file)))) return fs.realpathSync(sibling);
 }
 
 // The Markdown parser of the formatter that ran, so both agree on what is a code block, also after either updates: Oxfmt's copy
@@ -306,20 +329,22 @@ async function markdownParser(command, file, env, signal) {
     const root = await packageOf('oxfmt', command.executable, command.cwd, env, signal);
     // shortcut: Oxfmt names the chunk `markdown-<hash>.js`; a test against the installed Oxfmt notices when that changes.
     const chunks = root && fs.existsSync(path.join(root, 'dist')) ? fs.readdirSync(path.join(root, 'dist')).filter(name => /^markdown-[\w-]+\.js$/.test(name)) : [];
-    // Oxfmt has no parser option: a Markdown file is Markdown.
+    // Oxfmt has neither a parser option nor plugins: a Markdown file is Markdown.
     return chunks.length === 1 ? { module: path.join(root, 'dist', chunks[0]), parser: 'markdown' } : { reason: "no Markdown parser found in oxfmt's package" };
   }
   if (command.tool !== 'prettier') return { reason: `${command.tool} has no Markdown parser to find them with` };
   const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env, signal);
-  // Prettier 3, then Prettier 2.
-  const module = root && ['plugins/markdown.js', 'parser-markdown.js'].map(name => path.join(root, name)).find(candidate => fs.existsSync(candidate));
-  if (!module) return { reason: "no Markdown parser found in prettier's package" };
-  // A config can give Markdown files another parser; MDX reads code inside JSX and exports as code blocks, so only Markdown counts.
-  const { error, stdout } = await execute(command.executable, ['--file-info', file], '', { cwd: command.cwd, env, signal });
+  const module = root && path.join(root, 'plugins', 'markdown.js');
+  if (!module || !fs.existsSync(module)) return { reason: "no Markdown parser of Prettier 3 found in prettier's package (Prettier 2 loads plugins by itself)" };
+  // The parser Prettier picks for the file, from a config's overrides too, and its plugins, which can replace any parser.
+  const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'prettier-info.cjs'), root, file], '', { cwd: command.cwd, env, signal });
   signal?.throwIfAborted();
-  let parser;
-  try { parser = !error && JSON.parse(stdout).inferredParser; } catch {}
-  return ['markdown', 'remark'].includes(parser) ? { module, parser } : { reason: `prettier formats this file with the ${parser || 'unknown'} parser` };
+  let info = {};
+  try { info = JSON.parse(stdout); } catch {}
+  if (error || !info.parser) return { reason: `prettier says nothing about this file: ${stderr.trim() || error?.message || 'no parser'}` };
+  if (info.plugins.length) return { reason: 'prettier has plugins for this file, which can read Markdown differently' };
+  // MDX reads code inside JSX and exports as code blocks, so only Markdown counts.
+  return ['markdown', 'remark'].includes(info.parser) ? { module, parser: info.parser } : { reason: `prettier formats this file with the ${info.parser} parser` };
 }
 
 // Every code node the parser finds: its language, code, offsets, and whether a `prettier-ignore` comment covers it.
