@@ -22,6 +22,8 @@ const oxfmtConfigs = [
   '.oxfmtrc.json', '.oxfmtrc.jsonc',
   ...['js', 'mjs', 'cjs', 'ts', 'mts', 'cts'].map(ext => `oxfmt.config.${ext}`),
 ];
+// In CSharpier's precedence within one folder.
+const csharpierConfigs = ['.csharpierrc', '.csharpierrc.json', '.csharpierrc.yaml', '.csharpierrc.yml', '.editorconfig'];
 // The path a formatter sees. A document without a file of its own (settings.json, untitled, a notebook cell) gets one at its own
 // location or the workspace root, so project config applies, and a name that selects its language's syntax if it has none yet.
 function documentPath({ fileName, languageId, uri }, root, languages = [], oxcExtensions = []) {
@@ -219,7 +221,7 @@ function toolEnv(nodePath) {
 }
 
 // Runs a program with input on stdin; failures come back as `error`, with the exit code or `ENOENT` as its `code`, as from
-// execFile. In a process group of its own, so a timeout or a cancellation also ends what it started, like rumdl's formatters.
+// execFile. In a process group of its own, so a timeout or a cancellation also ends what it started, like an npm launcher's program.
 function execute(executable, args, input, { cwd, env, signal }) {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve({ error: signal.reason, stdout: '', stderr: '' });
@@ -273,77 +275,129 @@ async function run(command, input, file, env, signal, log) {
   return output;
 }
 
-// The length of the front matter, found as Prettier 3 finds it: YAML or TOML, which rumdl would take for Markdown.
-// It ends at the first line starting with its opening delimiter; YAML, if there is none, at the first one starting with `...`.
-function frontMatterLength(text) {
-  const start = text.slice(0, 3);
-  const lineBreak = text.indexOf('\n', 3);
-  if ((start !== '---' && start !== '+++') || lineBreak === -1) return 0;
-  let end = text.indexOf(`\n${start}`, lineBreak);
-  if (end === -1 && start === '---' && ['', 'yaml'].includes(text.slice(3, lineBreak).trim())) end = text.indexOf('\n...', lineBreak);
-  return end === -1 ? 0 : end + 4;
+// The info strings of the code blocks formatted here, lowercased; Prettier's `lang` is the info string's first word.
+const languages = { python: ['python', 'py', 'python3', 'py3'], csharp: ['csharp', 'cs', 'c#'] };
+// A fence that may hold Python or C#; only spares parsing a file without one.
+const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
+// Prettier's Markdown parser, which Oxfmt formats Markdown with too, so both agree on what is a code block.
+let markdownParser;
+
+// The fenced Python and C# blocks as Prettier finds them, also in lists and blockquotes: each with its code, where its lines
+// start and end, and the prefix every line carries (a list's indentation, a blockquote's `> `). A block whose lines do not follow
+// from its code and one prefix, or one without a closing fence, is left out, so it stays as it is.
+async function codeBlocks(text) {
+  markdownParser ??= require('prettier/plugins/markdown').parsers.markdown;
+  const blocks = [];
+  const visit = node => {
+    const language = Object.keys(languages).find(name => languages[name].includes(node.lang?.toLowerCase()));
+    if (node.type === 'code' && language) {
+      const { start, end } = node.position;
+      const lines = text.slice(start.offset, end.offset).split('\n');
+      const fence = lines[0].match(/^(`{3,}|~{3,})/)?.[1];
+      const closing = lines.at(-1).match(/^[ >]*(`{3,}|~{3,})[ \t]*$/)?.[1];
+      const code = node.value.split('\n');
+      const first = code.findIndex(Boolean);
+      const content = lines.slice(1, -1);
+      if (fence && lines.length > 2 && closing?.[0] === fence[0] && closing.length >= fence.length && first !== -1 && content[first]?.endsWith(code[first])) {
+        const prefix = content[first].slice(0, content[first].length - code[first].length);
+        const blank = content[code.indexOf('')] ?? prefix.trimEnd();
+        const lineOf = line => line ? prefix + line : blank;
+        if (code.map(lineOf).join('\n') === content.join('\n')) {
+          blocks.push({ language, code: node.value, lineOf, start: start.offset + lines[0].length + 1, end: end.offset - lines.at(-1).length });
+        }
+      }
+    }
+    node.children?.forEach(visit);
+  };
+  visit(await markdownParser.parse(text, {}));
+  return blocks;
 }
 
-// A fence that may hold Python or C#; only spares a rumdl run for files without one.
-const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
+// Ruff starts in milliseconds, so each Python block goes to it on its own, named so that the document folder's config applies.
+function formatPython(blocks, file, cwd, env, signal, log) {
+  const name = path.join(path.dirname(file), 'snippet.py');
+  const logged = new Set();
+  const once = message => logged.has(message) || (logged.add(message), log(message));
+  return Promise.all(blocks.map(async ({ code }) => {
+    const { error, stdout, stderr } = await execute('ruff', ['format', '--stdin-filename', name, '-'], `${code}\n`, { cwd, env, signal });
+    if (!error) return { formatted: stdout };
+    if (error.code === 'ENOENT') once('Ruff is not installed; Python blocks stay as they are.');
+    else if (/Failed to parse/.test(stderr)) return { invalid: true };
+    else once(`ruff: ${stderr.trim() || error.message}`);
+    return {};
+  }));
+}
 
-// Markdown formatters leave Python and C# blocks alone. rumdl finds them with its Markdown parser, also in lists and blockquotes,
-// and hands each to Ruff or CSharpier; a block a tool cannot format, like a C# method without its class, stays as it is.
-async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
-  // Prettier finds front matter after a byte order mark.
-  const bom = markdown.startsWith('\uFEFF') ? 1 : 0;
-  const front = markdown.slice(0, bom + frontMatterLength(markdown.slice(bom)));
-  const body = markdown.slice(front.length);
-  if (!codeFence.test(body)) return markdown;
-  // Where rumdl reads Markdown differently from Prettier, a fence that is text could be formatted as code: rumdl takes a line of
-  // form feeds or vertical tabs for a blank line, which ends an HTML block early, and has no `$$` math blocks.
-  const unsafe = /[\v\f]/.test(body) ? 'a form feed or vertical tab'
-    : /^(?:[ \t]*(?:>|[-+*](?=[ \t])|\d{1,9}[.)](?=[ \t])))*[ \t]*\$\$/m.test(body) ? 'a $$ math block' : undefined;
-  if (unsafe) {
-    log(`rumdl: Python and C# blocks stay as they are, since this file has ${unsafe}.`);
-    return markdown;
-  }
-  // rumdl formats code blocks only in a file, so it gets a copy. The tools read the project's config from the document's folder.
+// CSharpier starts .NET on every run and has no Markdown support, so all C# blocks go to it at once, as files of their own.
+async function formatCSharp(blocks, file, cwd, env, signal, log) {
+  if (!blocks.length) return [];
+  // The files are in a temporary folder, so the project's config is passed along.
+  // shortcut: only the nearest config file counts; .editorconfig files above it are not merged as CSharpier would.
+  const config = projectDirs(file).flatMap(dir => csharpierConfigs.map(name => path.join(dir, name))).find(candidate => fs.existsSync(candidate));
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-formatter-'));
   try {
-    const copy = path.join(dir, path.basename(file));
-    const config = path.join(dir, 'rumdl.toml');
-    // A JSON string is a TOML string, once DEL is escaped too.
-    const snippet = extension => JSON.stringify(path.join(path.dirname(file), `snippet.${extension}`)).replaceAll('\x7f', '\\u007f');
-    await fs.promises.writeFile(copy, body);
-    await fs.promises.writeFile(config, `[code-block-tools]
-enabled = true
-on-error = "warn"
-
-[code-block-tools.languages]
-python = { format = ["ruff"] }
-csharp = { format = ["csharpier"] }
-
-[code-block-tools.tools.ruff]
-command = ["ruff", "format", "--stdin-filename", ${snippet('py')}, "-"]
-stdin = true
-stdout = true
-
-[code-block-tools.tools.csharpier]
-command = ["csharpier", "format", "--stdin-path", ${snippet('cs')}]
-stdin = true
-stdout = true
-`);
-    const { error, stdout, stderr } = await execute('rumdl', ['fmt', '--only-code-block-tools', '--no-cache', '--quiet', '--config', config, copy], '', { cwd, env, signal });
+    const files = blocks.map((_, index) => path.join(dir, `${index}.cs`));
+    await Promise.all(files.map((name, index) => fs.promises.writeFile(name, `${blocks[index].code}\n`)));
+    const args = ['format', '--no-cache', '--no-msbuild-check', ...(config ? ['--config-path', config] : []), dir];
+    const { error, stdout, stderr } = await execute('csharpier', args, '', { cwd, env, signal });
     signal?.throwIfAborted();
-    // rumdl counts lines without the front matter and before formatting.
-    const lines = front.split('\n').length - 1;
-    const messages = `${stdout}\n${stderr}`.trim().replaceAll(/^Warning: .*?:(\d+): /gm, (_, line) => `line ${Number(line) + lines} before formatting: `);
-    if (error) {
-      log(error.code === 'ENOENT' ? 'rumdl is not installed; Python and C# blocks stay as they are.' : `rumdl: ${messages || error.message}`);
-      return markdown;
+    const messages = `${stdout}\n${stderr}`;
+    // A block that is not valid C# on its own, like a method without its class, makes CSharpier exit with 1 and format the rest.
+    // After any other failure no file is trusted, since one may be half written.
+    const syntaxErrorsOnly = error?.code === 1 && messages.split('\n').every(line =>
+      !line.trim() || /^\s/.test(line) || /^Formatted \d+ files? in /.test(line) || /^Error .*\d+\.cs - Was not formatted due to syntax errors\.$/.test(line));
+    if (error && !syntaxErrorsOnly) {
+      log(error.code === 'ENOENT' ? 'CSharpier is not installed; C# blocks stay as they are.' : `csharpier: ${messages.trim() || error.message}`);
+      return [];
     }
-    if (messages) log(`rumdl: ${messages}`);
-    const result = await fs.promises.readFile(copy, 'utf8');
-    return result.trim() ? front + result : markdown;
+    const invalid = new Set([...messages.matchAll(/(\d+)\.cs - Was not formatted due to syntax errors/g)].map(([, index]) => Number(index)));
+    // CSharpier writes a file only when it formatted it.
+    return Promise.all(files.map(async (name, index) => invalid.has(index) ? { invalid: true } : { formatted: await fs.promises.readFile(name, 'utf8') }));
   } finally {
     await fs.promises.rm(dir, { recursive: true, force: true });
   }
+}
+
+// Markdown formatters leave Python and C# blocks alone; this formats them with Ruff and CSharpier.
+async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
+  // Prettier parses without a byte order mark and with \n line breaks; a file mixing line breaks, or with a lone \r, stays as it is.
+  const bom = markdown.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const parts = markdown.slice(bom.length).split('\r\n');
+  const eol = parts.length > 1 ? '\r\n' : '\n';
+  if (parts.some(part => part.includes('\r') || (eol === '\r\n' && part.includes('\n')))) return markdown;
+  const text = parts.join('\n');
+  if (!codeFence.test(text)) return markdown;
+  let blocks;
+  try {
+    blocks = await codeBlocks(text);
+  } catch (error) {
+    log(`Python and C# blocks stay as they are: ${error.message}`);
+    return markdown;
+  }
+  if (!blocks.length) return markdown;
+  const python = blocks.filter(({ language }) => language === 'python');
+  const csharp = blocks.filter(({ language }) => language === 'csharp');
+  const [pythonResults, csharpResults] = await Promise.all([formatPython(python, file, cwd, env, signal, log), formatCSharp(csharp, file, cwd, env, signal, log)]);
+  signal?.throwIfAborted();
+  const results = new Map([...python.map((block, index) => [block, pythonResults[index]]), ...csharp.map((block, index) => [block, csharpResults[index]])]);
+  let output = '';
+  let last = 0;
+  const invalid = { python: [], csharp: [] };
+  for (const block of blocks) {
+    output += text.slice(last, block.start);
+    const { formatted: printed, invalid: unparsable } = results.get(block) ?? {};
+    // A project's config may make a tool print CRLF; the file's own line breaks are set again at the end.
+    const formatted = printed?.replace(/\r\n?/g, '\n');
+    // The fence's line in the formatted file, the one the user sees.
+    if (unparsable) invalid[block.language].push(output.split('\n').length - 1);
+    // Ruff and CSharpier end their output with a line break, which keeps the closing fence on a line of its own.
+    const changed = formatted?.endsWith('\n') && formatted.trim() && formatted !== `${block.code}\n`;
+    output += changed ? `${formatted.slice(0, -1).split('\n').map(block.lineOf).join('\n')}\n` : text.slice(block.start, block.end);
+    last = block.end;
+  }
+  if (invalid.python.length) log(`ruff: the Python blocks at lines ${invalid.python.join(', ')} are not valid Python on their own and stay as they are.`);
+  if (invalid.csharp.length) log(`csharpier: the C# blocks at lines ${invalid.csharp.join(', ')} are not valid C# on their own and stay as they are.`);
+  return bom + (output + text.slice(last)).split('\n').join(eol);
 }
 
 async function format(input, file, oxc = {}, signal, log = () => {}) {
