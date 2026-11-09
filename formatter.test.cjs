@@ -389,6 +389,7 @@ for (const name of fs.readdirSync(dir)) {
   const file = path.join(dir, name), code = fs.readFileSync(file, 'utf8');
   if (code.includes('broken')) { console.log('Error ' + file + ' - Was not formatted due to syntax errors.'); process.exitCode = 1; }
   else if (code.includes('crash')) { fs.writeFileSync(file, 'VAR'); console.error('Unhandled exception: disk full'); process.exitCode = 2; }
+  else if (code.includes('quiet')) { fs.writeFileSync(file, 'VAR'); process.exitCode = 1; }
   else fs.writeFileSync(file, code.includes('no break') ? code.toUpperCase().trimEnd() : code.toUpperCase());
 }`);
   return {
@@ -512,6 +513,8 @@ test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks the p
   assert.equal(await run(crash), crash);
   assert.ok(log.includes('csharpier: Unhandled exception: disk full'), log.join('\n'));
   assert.equal(await run('```cs\nno break\n```\n'), '```cs\nno break\n```\n');
+  // Exit code 1 counts as syntax errors only with CSharpier's message for one.
+  assert.equal(await run('```cs\nvar a;\n```\n\n```cs\nquiet\n```\n'), '```cs\nvar a;\n```\n\n```cs\nquiet\n```\n');
   // A tool printing CRLF, as a project's config can make it, still gives the file's own line breaks.
   fs.writeFileSync(path.join(root, 'bin', 'ruff'), fs.readFileSync(path.join(root, 'bin', 'ruff'), 'utf8').replace("text.replaceAll('=', ' = ')", "text.replaceAll('=', ' = ').replaceAll('\\n', '\\r\\n')"));
   assert.equal(await run('```py\nx=1\ny=2\n```\n'), '```py\nx = 1\ny = 2\n```\n');
@@ -564,14 +567,14 @@ test('the Markdown parser is the one of the formatter that ran', async t => {
   fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
   fakePrettier(path.join(root, 'node_modules'));
   assert.equal(await run(), formatted);
-  // A global Prettier on the PATH, run through its package's command.
+  // A global Prettier 3 on the PATH, kept loaded from its package, which reports how it parsed the file with its result.
   stopPrettier();
   fs.rmSync(path.join(root, 'node_modules'), { recursive: true });
   fakePrettier(path.join(root, 'global', 'node_modules'));
   process.env.PATH = [path.join(root, 'global', 'node_modules', '.bin'), process.env.PATH].join(path.delimiter);
   log.length = 0;
   assert.equal(await run(), formatted);
-  assert.ok(log.some(message => message.endsWith('prettier (.prettierrc)')), log.join('\n'));
+  assert.ok(log.some(message => message.endsWith('prettier (.prettierrc), kept loaded')), log.join('\n'));
   // A shim script in `node_modules/.bin`, as pnpm and aube write them, that runs the package next to it.
   fs.rmSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'));
   fs.writeFileSync(path.join(root, 'global', 'node_modules', '.bin', 'prettier'), `#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/../prettier/bin/prettier.cjs" "$@"\n`, { mode: 0o755 });

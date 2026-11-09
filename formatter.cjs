@@ -155,7 +155,7 @@ function invocation(file, oxc = {}, selection = detect(file)) {
   const executable = (isOxfmt && oxc.oxfmtPath) || (local && nativeProgram(selection.tool, local)) || local || selection.tool;
   // Also as there: its settings apply, and it runs from the workspace folder, the one place it reads ignore files from.
   const flags = isOxfmt ? [...(oxc.configPath ? [`--config=${oxc.configPath}`] : []), ...(oxc.disableNestedConfig ? ['--disable-nested-config'] : [])] : [];
-  // Only Prettier 3 ships index.cjs; older and global Prettier run through the CLI.
+  // Only Prettier 3 ships index.cjs; older Prettier runs through the CLI. A global Prettier 3 is found when it runs (see run).
   const prettier = selection.tool === 'prettier' && local && path.join(path.dirname(local), '..', 'prettier', 'index.cjs');
   return { ...selection, cwd: (isOxfmt && oxc.folder) || selection.cwd, executable, args: [...flags, ...tools[selection.tool].args, file],
     prettier: prettier && fs.existsSync(prettier) ? prettier : undefined };
@@ -273,6 +273,11 @@ function execute(executable, args, input, { cwd, env, signal }) {
 }
 
 async function run(command, input, file, env, signal, log) {
+  // A global Prettier 3 stays loaded too: its package, found as for the Markdown parser, has the same index.cjs.
+  if (command.tool === 'prettier' && !command.prettier) {
+    const root = await packageOf('prettier', command.executable, command.cwd, env, signal);
+    if (root && fs.existsSync(path.join(root, 'index.cjs'))) command.prettier = path.join(root, 'index.cjs');
+  }
   log(`${file}: ${command.tool} (${command.reason})${command.prettier ? ', kept loaded' : ''}`);
   if (command.tool === 'bun') {
     const { stdout } = await promisify(execFile)(command.executable, ['--help'], { cwd: command.cwd, env, encoding: 'utf8', timeout: 5000, signal });
@@ -339,20 +344,13 @@ async function markdownParser(command, file, env, signal) {
     return chunks.length === 1 ? { module: path.join(root, 'dist', chunks[0]), parser: 'markdown' } : { reason: "no Markdown parser found in oxfmt's package" };
   }
   if (command.tool !== 'prettier') return { reason: `${command.tool} has no Markdown parser to find them with` };
-  const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env, signal);
-  const module = root && path.join(root, 'plugins', 'markdown.js');
+  // Prettier 3 runs kept loaded, local or global; Prettier 2 runs as a CLI and loads plugins by itself.
+  const module = command.prettier && path.join(path.dirname(command.prettier), 'plugins', 'markdown.js');
   if (!module || !fs.existsSync(module)) return { reason: "no Markdown parser of Prettier 3 found in prettier's package (Prettier 2 loads plugins by itself)" };
-  // The parser Prettier formatted the file with, from a config's overrides too, and its plugins, which can replace any parser.
-  // The kept-loaded Prettier reports them with its result, from the config it used, which may be older than the files on disk;
-  // the CLI starts afresh on every run, and so does prettier-info.cjs.
-  let info = command.reported ?? {};
-  if (!command.prettier) {
-    const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'prettier-info.cjs'), root, file], '', { cwd: command.cwd, env, signal });
-    signal?.throwIfAborted();
-    try { info = JSON.parse(stdout); } catch {}
-    if (error) info = { error: stderr.trim() || error.message };
-  }
-  if (!info.parser) return { reason: `prettier says nothing about this file${info.error ? `: ${info.error}` : ''}` };
+  // The parser Prettier formatted the file with, from a config's overrides too, and its plugins, which can replace any parser,
+  // as it reported them with that very result: from the config it used, which may be older than the files on disk.
+  const info = command.reported ?? {};
+  if (!info.parser) return { reason: 'prettier did not report how it parsed this file' };
   if (info.plugins.length) return { reason: 'prettier has plugins for this file, which can read Markdown differently' };
   // MDX reads code inside JSX and exports as code blocks, so only Markdown counts.
   return ['markdown', 'remark'].includes(info.parser) ? { module, parser: info.parser } : { reason: `prettier formats this file with the ${info.parser} parser` };
@@ -421,7 +419,7 @@ async function formatCSharp(blocks, file, cwd, env, signal, log) {
     const messages = `${stdout}\n${stderr}`;
     // A block that is not valid C# on its own, like a method without its class, makes CSharpier exit with 1 and format the rest.
     // After any other failure no file is trusted, since one may be half written.
-    const syntaxErrorsOnly = error?.code === 1 && messages.split('\n').every(line =>
+    const syntaxErrorsOnly = error?.code === 1 && / - Was not formatted due to syntax errors\./.test(messages) && messages.split('\n').every(line =>
       !line.trim() || /^\s/.test(line) || /^Formatted \d+ files? in /.test(line) || /^Error .*\d+\.cs - Was not formatted due to syntax errors\.$/.test(line));
     if (error && !syntaxErrorsOnly) {
       log(error.code === 'ENOENT' ? 'CSharpier is not installed; C# blocks stay as they are.' : `csharpier: ${messages.trim() || error.message}`);
