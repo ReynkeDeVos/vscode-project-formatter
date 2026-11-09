@@ -275,41 +275,68 @@ async function run(command, input, file, env, signal, log) {
   return output;
 }
 
-// The info strings of the code blocks formatted here, lowercased; Prettier's `lang` is the info string's first word.
+// The info strings of the code blocks formatted here, lowercased; a parser's `lang` is the info string's first word.
 const languages = { python: ['python', 'py', 'python3', 'py3'], csharp: ['csharp', 'cs', 'c#'] };
 // A fence that may hold Python or C#; only spares parsing a file without one.
 const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
-// Prettier's Markdown parser, which Oxfmt formats Markdown with too, so both agree on what is a code block.
-let markdownParser;
 
-// The fenced Python and C# blocks as Prettier finds them, also in lists and blockquotes: each with its code, where its lines
-// start and end, and the prefix every line carries (a list's indentation, a blockquote's `> `). A block whose lines do not follow
-// from its code and one prefix, or one without a closing fence, is left out, so it stays as it is.
-async function codeBlocks(text) {
-  markdownParser ??= require('prettier/plugins/markdown').parsers.markdown;
+// The package a formatter's executable belongs to. npm, pnpm and aube put `node_modules/.bin/<tool>` next to the package, and
+// npm links into it. A bare name is looked up on the PATH, and a mise shim through `mise which`.
+async function packageOf(tool, executable, cwd, env) {
+  let bin = path.isAbsolute(executable) ? executable
+    : env.PATH.split(path.delimiter).map(dir => path.join(dir, executable)).find(candidate => fs.existsSync(candidate));
+  if (bin && path.basename(fs.realpathSync(bin)) === 'mise') bin = (await execute('mise', ['which', tool], '', { cwd, env })).stdout.trim();
+  if (!bin || !fs.existsSync(bin)) return;
+  const named = dir => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name === tool; } catch { return false; } };
+  const sibling = path.join(path.dirname(bin), '..', tool);
+  if (named(sibling)) return fs.realpathSync(sibling);
+  for (let dir = path.dirname(fs.realpathSync(bin)); dir !== path.dirname(dir); dir = path.dirname(dir)) if (named(dir)) return dir;
+}
+
+// The Markdown parser of the formatter that ran, so both agree on what is a code block, also after either updates: Prettier's
+// plugin from that Prettier, or the copy in Oxfmt's package, which Oxfmt formats Markdown with.
+async function markdownParser(command, env) {
+  if (command.tool === 'prettier') {
+    const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env);
+    // Prettier 3, then Prettier 2.
+    return root && ['plugins/markdown.js', 'parser-markdown.js'].map(name => path.join(root, name)).find(candidate => fs.existsSync(candidate));
+  }
+  if (command.tool !== 'oxfmt') return;
+  const dist = path.join(await packageOf('oxfmt', command.executable, command.cwd, env) ?? '', 'dist');
+  // shortcut: Oxfmt names the chunk `markdown-<hash>.js`; a test against the installed Oxfmt notices when that changes.
+  const chunks = fs.existsSync(dist) ? fs.readdirSync(dist).filter(name => /^markdown-[\w-]+\.js$/.test(name)) : [];
+  return chunks.length === 1 ? path.join(dist, chunks[0]) : undefined;
+}
+
+// Every code node the parser finds: its language, code, offsets, and whether a `prettier-ignore` comment covers it.
+async function codeNodes(text, parser, cwd, env, signal) {
+  const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'markdown-blocks.cjs'), parser], text, { cwd, env, signal });
+  signal?.throwIfAborted();
+  if (error) throw Object.assign(new Error(stderr.trim() || error.message), { code: error.code });
+  return JSON.parse(stdout);
+}
+
+// The fenced Python and C# blocks among the nodes, also in lists and blockquotes: each with its code, its fence, where its lines
+// start and end, and the prefix every line carries (a list's indentation, a blockquote's `> `). A block whose lines do not
+// follow from its code and one prefix, one without a closing fence, or one Prettier ignores, is left out, so it stays as it is.
+function codeBlocks(text, nodes) {
   const blocks = [];
-  const visit = node => {
+  for (const node of nodes) {
     const language = Object.keys(languages).find(name => languages[name].includes(node.lang?.toLowerCase()));
-    if (node.type === 'code' && language) {
-      const { start, end } = node.position;
-      const lines = text.slice(start.offset, end.offset).split('\n');
-      const fence = lines[0].match(/^(`{3,}|~{3,})/)?.[1];
-      const closing = lines.at(-1).match(/^[ >]*(`{3,}|~{3,})[ \t]*$/)?.[1];
-      const code = node.value.split('\n');
-      const first = code.findIndex(Boolean);
-      const content = lines.slice(1, -1);
-      if (fence && lines.length > 2 && closing?.[0] === fence[0] && closing.length >= fence.length && first !== -1 && content[first]?.endsWith(code[first])) {
-        const prefix = content[first].slice(0, content[first].length - code[first].length);
-        const blank = content[code.indexOf('')] ?? prefix.trimEnd();
-        const lineOf = line => line ? prefix + line : blank;
-        if (code.map(lineOf).join('\n') === content.join('\n')) {
-          blocks.push({ language, code: node.value, lineOf, start: start.offset + lines[0].length + 1, end: end.offset - lines.at(-1).length });
-        }
-      }
-    }
-    node.children?.forEach(visit);
-  };
-  visit(await markdownParser.parse(text, {}));
+    if (!language || node.ignored) continue;
+    const lines = text.slice(node.start, node.end).split('\n');
+    const fence = lines[0].match(/^(`{3,}|~{3,})/)?.[1];
+    const closing = lines.at(-1).match(/^[ >]*(`{3,}|~{3,})[ \t]*$/)?.[1];
+    const code = node.value.split('\n');
+    const first = code.findIndex(Boolean);
+    const content = lines.slice(1, -1);
+    if (!fence || lines.length < 3 || closing?.[0] !== fence[0] || closing.length < fence.length || first === -1 || !content[first]?.endsWith(code[first])) continue;
+    const prefix = content[first].slice(0, content[first].length - code[first].length);
+    const blank = content[code.indexOf('')] ?? prefix.trimEnd();
+    const lineOf = line => line ? prefix + line : blank;
+    if (code.map(lineOf).join('\n') !== content.join('\n')) continue;
+    blocks.push({ language, code: node.value, fence, lineOf, start: node.start + lines[0].length + 1, end: node.end - lines.at(-1).length });
+  }
   return blocks;
 }
 
@@ -351,15 +378,18 @@ async function formatCSharp(blocks, file, cwd, env, signal, log) {
       return [];
     }
     const invalid = new Set([...messages.matchAll(/(\d+)\.cs - Was not formatted due to syntax errors/g)].map(([, index]) => Number(index)));
-    // CSharpier writes a file only when it formatted it.
-    return Promise.all(files.map(async (name, index) => invalid.has(index) ? { invalid: true } : { formatted: await fs.promises.readFile(name, 'utf8') }));
+    // CSharpier writes a file only when it formatted it. Awaited here, so the folder is removed only after every file is read.
+    const results = await Promise.all(files.map(async (name, index) => invalid.has(index) ? { invalid: true } : { formatted: await fs.promises.readFile(name, 'utf8') }));
+    return results;
   } finally {
     await fs.promises.rm(dir, { recursive: true, force: true });
   }
 }
 
-// Markdown formatters leave Python and C# blocks alone; this formats them with Ruff and CSharpier.
-async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
+// Markdown formatters leave Python and C# blocks alone; this formats them with Ruff and CSharpier. `unchanged`: the formatter
+// returned its input, as it does for a file it ignores.
+async function formatCodeBlocks(markdown, file, command, env, signal, log, unchanged) {
+  const { cwd } = command;
   // Prettier parses without a byte order mark and with \n line breaks; a file mixing line breaks, or with a lone \r, stays as it is.
   const bom = markdown.startsWith('\uFEFF') ? '\uFEFF' : '';
   const parts = markdown.slice(bom.length).split('\r\n');
@@ -367,14 +397,29 @@ async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
   if (parts.some(part => part.includes('\r') || (eol === '\r\n' && part.includes('\n')))) return markdown;
   const text = parts.join('\n');
   if (!codeFence.test(text)) return markdown;
-  let blocks;
-  try {
-    blocks = await codeBlocks(text);
-  } catch (error) {
-    log(`Python and C# blocks stay as they are: ${error.message}`);
+  const parser = await markdownParser(command, env);
+  if (!parser) {
+    log(`Python and C# blocks stay as they are: no Markdown parser found in ${command.tool}'s package.`);
     return markdown;
   }
+  const parse = async source => {
+    try {
+      return await codeNodes(source, parser, cwd, env, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      log(`Python and C# blocks stay as they are: ${error.code === 'ENOENT' ? 'Node.js is not installed' : error.message}`);
+    }
+  };
+  const nodes = await parse(text);
+  const blocks = nodes ? codeBlocks(text, nodes) : [];
   if (!blocks.length) return markdown;
+  // A file it ignores, the formatter returns unchanged, as one already formatted; a heading it would fix tells them apart.
+  const probe = '#  Probe\n';
+  if (unchanged && await run(command, probe, file, env, signal, () => {}).then(output => output === probe, () => true)) {
+    signal?.throwIfAborted();
+    log(`Python and C# blocks stay as they are: ${command.tool} ignores this file.`);
+    return markdown;
+  }
   const python = blocks.filter(({ language }) => language === 'python');
   const csharp = blocks.filter(({ language }) => language === 'csharp');
   const [pythonResults, csharpResults] = await Promise.all([formatPython(python, file, cwd, env, signal, log), formatCSharp(csharp, file, cwd, env, signal, log)]);
@@ -390,19 +435,33 @@ async function formatCodeBlocks(markdown, file, cwd, env, signal, log) {
     const formatted = printed?.replace(/\r\n?/g, '\n');
     // The fence's line in the formatted file, the one the user sees.
     if (unparsable) invalid[block.language].push(output.split('\n').length - 1);
+    const lines = formatted?.slice(0, -1).split('\n') ?? [];
+    // A line of the formatted code that would close the block early, like a fence in a string Ruff dedents.
+    const closing = lines.find(line => line.match(/^\s*(`{3,}|~{3,})\s*$/)?.[1].startsWith(block.fence));
+    if (closing) log(`The ${block.language === 'python' ? 'Python' : 'C#'} block at line ${output.split('\n').length - 1} stays as it is: its formatted code would close it early.`);
     // Ruff and CSharpier end their output with a line break, which keeps the closing fence on a line of its own.
-    const changed = formatted?.endsWith('\n') && formatted.trim() && formatted !== `${block.code}\n`;
-    output += changed ? `${formatted.slice(0, -1).split('\n').map(block.lineOf).join('\n')}\n` : text.slice(block.start, block.end);
+    const changed = !closing && formatted?.endsWith('\n') && formatted.trim() && formatted !== `${block.code}\n`;
+    output += changed ? `${lines.map(block.lineOf).join('\n')}\n` : text.slice(block.start, block.end);
     last = block.end;
   }
+  output += text.slice(last);
   if (invalid.python.length) log(`ruff: the Python blocks at lines ${invalid.python.join(', ')} are not valid Python on their own and stay as they are.`);
   if (invalid.csharp.length) log(`csharpier: the C# blocks at lines ${invalid.csharp.join(', ')} are not valid C# on their own and stay as they are.`);
-  return bom + (output + text.slice(last)).split('\n').join(eol);
+  // Only code may have changed: read again, everything outside the code nodes, and the nodes' languages, must be as before.
+  const outside = (source, found) => found.reduce((masked, node, index) =>
+    masked + source.slice(index ? found[index - 1].end : 0, node.start) + `\0${node.lang}\0`, '') + source.slice(found.at(-1)?.end ?? 0);
+  const after = output === text ? nodes : await parse(output);
+  if (!after) return markdown;
+  if (outside(output, after) !== outside(text, nodes)) {
+    log('Python and C# blocks stay as they are: their formatted code would change the Markdown around it.');
+    return markdown;
+  }
+  return bom + output.split('\n').join(eol);
 }
 
 async function format(input, file, oxc = {}, signal, log = () => {}) {
   const env = toolEnv(oxc.nodePath);
-  const command = invocation(file, oxc);
+  let command = invocation(file, oxc);
   let output;
   try {
     output = await run(command, input, file, env, signal, log);
@@ -411,12 +470,13 @@ async function format(input, file, oxc = {}, signal, log = () => {}) {
     // shortcut: only Prettier's message is recognized; add Biome's and dprint's when a project needs them.
     // The whole message after any warnings, because syntax errors quote the source and file name, which can contain these words.
     if (!/^prettier: (?:\[warn\] .*\n)*(?:\[error\] )?No parser could be inferred for file:? .*$/.test(error.message)) throw error;
-    const fallback = { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' };
-    output = await run(invocation(file, oxc, fallback), input, file, env, signal, log);
+    command = invocation(file, oxc, { tool: 'oxfmt', cwd: command.cwd, reason: 'Prettier has no parser for this file' });
+    output = await run(command, input, file, env, signal, log);
   }
   // dprint hands code blocks to its own plugins.
   if (command.tool === 'dprint' || !/\.(?:md|markdown)$/i.test(file)) return output;
-  return formatCodeBlocks(output, file, command.cwd, env, signal, log);
+  // With the formatter that ran: its parser finds the blocks.
+  return formatCodeBlocks(output, file, command, env, signal, log, output === input);
 }
 
 module.exports = { detect, documentPath, invocation, format, oxcPath, oxcRules, stopPrettier };

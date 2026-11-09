@@ -17,5 +17,5 @@
   "activationEvents": ["onStartupFinished"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
   "scripts": { "test": "node --test formatter.test.cjs" },
-  "dependencies": { "prettier": "3.9.10" }
+  "devDependencies": { "prettier": "3.9.10" }
 }

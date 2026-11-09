@@ -3,6 +3,8 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { pathToFileURL } = require('node:url');
 const { detect, documentPath, invocation, format, oxcPath, oxcRules, stopPrettier } = require('./formatter.cjs');
 
 // A throwaway repository root, so detection stops there instead of walking into the real temp directory.
@@ -380,7 +382,7 @@ ${body}\n`, { mode: 0o755 });
   script('ruff', `let text = '';
 process.stdin.on('data', data => text += data).on('end', () => {
   if (text.includes('broken')) { console.error('error: Failed to parse snippet.py:1:1: Expected an expression'); process.exitCode = 2; }
-  else process.stdout.write(text.replaceAll('=', ' = '));
+  else process.stdout.write(text.includes('dedent') ? text.replace(/^ +/gm, '') : text.replaceAll('=', ' = '));
 });`);
   script('csharpier', `const dir = process.argv.at(-1);
 for (const name of fs.readdirSync(dir)) {
@@ -395,11 +397,29 @@ for (const name of fs.readdirSync(dir)) {
   };
 }
 
-test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks Prettier finds', async t => {
+// A stand-in for a Markdown formatter: it fixes a heading's spacing, which tells it apart from one ignoring the file.
+const markdownFormatter = `#!/usr/bin/env node
+let text = '';
+process.stdin.on('data', data => text += data).on('end', () => process.stdout.write(text.replace(/^#  /gm, '# ')));
+`;
+
+// That formatter as Oxfmt, in a package with a Markdown chunk shaped like Oxfmt's, made of the Prettier in node_modules.
+function fakeOxfmt(root) {
+  const modules = path.join(root, 'tools', 'node_modules');
+  const plugin = path.join(path.dirname(require.resolve('prettier/package.json')), 'plugins', 'markdown.mjs');
+  fs.mkdirSync(path.join(modules, 'oxfmt', 'dist'), { recursive: true });
+  fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });
+  fs.writeFileSync(path.join(modules, 'oxfmt', 'package.json'), '{"name": "oxfmt", "type": "module"}');
+  fs.writeFileSync(path.join(modules, 'oxfmt', 'dist', 'markdown-Ab12_c.js'), `export { parsers } from ${JSON.stringify(pathToFileURL(plugin).href)};\n`);
+  const bin = path.join(modules, '.bin', 'oxfmt');
+  fs.writeFileSync(bin, markdownFormatter, { mode: 0o755 });
+  return bin;
+}
+
+test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks the parser finds', async t => {
   const root = repo(t, 'project-formatter-code-blocks-');
   const tools = codeBlockTools(t, root);
-  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
-  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', { mode: 0o755 });
+  const oxfmt = { oxfmtPath: fakeOxfmt(root) };
   const file = path.join(root, 'docs', 'lesson.md');
   fs.mkdirSync(path.dirname(file));
   const log = [];
@@ -444,6 +464,21 @@ test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks Prett
   // Code whose lines carry different prefixes, here a fence indented beyond its list item, stays as it is.
   const indented = '1. a\n\n    ```py\n    x=1\n   y=2\n    ```\n';
   assert.equal(await run(indented), indented);
+  // Code a `prettier-ignore` comment covers stays as it is, as Prettier keeps it.
+  const ignoredCode = '<!-- prettier-ignore -->\n```py\nx=1\n```\n\n<!-- prettier-ignore-start -->\n\n```py\nx=1\n```\n\n<!-- prettier-ignore-end -->\n\n```py\ny=1\n```\n';
+  assert.equal(await run(ignoredCode), ignoredCode.replace('y=1', 'y = 1'));
+  // Formatted code that would close its block early, like a fence in a dedented string, leaves the block as it is.
+  log.length = 0;
+  const dedent = '```py\n"""dedent\n    ```\n"""\n```\n\nOutside.\n';
+  assert.equal(await run(dedent), dedent);
+  assert.ok(log.includes('The Python block at line 1 stays as it is: its formatted code would close it early.'), log.join('\n'));
+  // A file the formatter ignores, it returns unchanged; its blocks stay too.
+  const formatter = fs.readFileSync(oxfmt.oxfmtPath, 'utf8');
+  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n');
+  log.length = 0;
+  assert.equal(await run('```py\nx=1\n```\n'), '```py\nx=1\n```\n');
+  assert.ok(log.includes('Python and C# blocks stay as they are: oxfmt ignores this file.'), log.join('\n'));
+  fs.writeFileSync(oxfmt.oxfmtPath, formatter);
   // A block that is not valid code on its own is reported at its fence's line.
   log.length = 0;
   await run('```cs\nvar a;\nvar b;\n```\n\n```cs\nbroken\n```\n\n```py\nbroken\n```\n');
@@ -484,20 +519,81 @@ test('Markdown: Ruff formats the Python blocks and CSharpier the C# blocks Prett
   assert.ok(log.includes('CSharpier is not installed; C# blocks stay as they are.'), log.join('\n'));
 });
 
-// Fails when an update of Ruff or CSharpier changes its output or how it reports a block it cannot format.
+test('the Markdown parser is the one of the formatter that ran', async t => {
+  const root = repo(t, 'project-formatter-markdown-parser-');
+  codeBlockTools(t, root);
+  const file = path.join(root, 'a.md');
+  const log = [];
+  const run = (oxc = {}) => format('```py\nx=1\n```\n', file, oxc, undefined, message => log.push(message));
+  const formatted = '```py\nx = 1\n```\n';
+  // An Oxfmt without a package has no parser to find the blocks with.
+  const lone = path.join(root, 'oxfmt');
+  fs.writeFileSync(lone, markdownFormatter, { mode: 0o755 });
+  assert.equal(await run({ oxfmtPath: lone }), '```py\nx=1\n```\n');
+  assert.ok(log.includes("Python and C# blocks stay as they are: no Markdown parser found in oxfmt's package."), log.join('\n'));
+  // Oxfmt on the PATH through a mise shim.
+  const bin = fakeOxfmt(root);
+  const mise = path.join(root, 'bin', 'mise');
+  fs.writeFileSync(mise, `#!/usr/bin/env node\nif (process.argv[2] === 'which') console.log(${JSON.stringify(bin)}); else require(${JSON.stringify(bin)});\n`, { mode: 0o755 });
+  fs.symlinkSync(mise, path.join(root, 'bin', 'oxfmt'));
+  assert.equal(await run(), formatted);
+  // The project's Prettier 3, kept loaded, with its plugin.
+  t.after(stopPrettier);
+  fs.writeFileSync(path.join(root, '.prettierrc'), '{}');
+  const prettier = path.join(root, 'node_modules', 'prettier');
+  fs.mkdirSync(path.join(prettier, 'plugins'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'node_modules', '.bin'));
+  fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'prettier'), '');
+  fs.writeFileSync(path.join(prettier, 'index.cjs'), 'exports.getFileInfo = async () => ({ ignored: false }); exports.resolveConfig = async () => ({}); exports.format = async text => text.replace(/^#  /gm, \'# \');');
+  fs.writeFileSync(path.join(prettier, 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
+  assert.equal(await run(), formatted);
+  // A global Prettier on the PATH, next to its package.
+  stopPrettier();
+  fs.rmSync(path.join(root, 'node_modules'), { recursive: true });
+  const global = path.join(root, 'global', 'node_modules');
+  fs.mkdirSync(path.join(global, 'prettier', 'plugins'), { recursive: true });
+  fs.mkdirSync(path.join(global, '.bin'));
+  fs.writeFileSync(path.join(global, 'prettier', 'package.json'), '{"name": "prettier"}');
+  fs.writeFileSync(path.join(global, 'prettier', 'plugins', 'markdown.js'), `module.exports = require(${JSON.stringify(require.resolve('prettier/plugins/markdown'))});`);
+  fs.writeFileSync(path.join(global, '.bin', 'prettier'), markdownFormatter, { mode: 0o755 });
+  process.env.PATH = [path.join(global, '.bin'), process.env.PATH].join(path.delimiter);
+  log.length = 0;
+  assert.equal(await run(), formatted);
+  assert.ok(log.some(message => message.endsWith('prettier (.prettierrc)')), log.join('\n'));
+});
+
 const shims = path.join(process.env.MISE_DATA_DIR || path.join(os.homedir(), '.local/share/mise'), 'shims');
-const installed = name => require('node:child_process').spawnSync(name, ['--version'], { env: { ...process.env, PATH: `${process.env.PATH}${path.delimiter}${shims}` } }).status === 0;
-test('Markdown with the installed Ruff and CSharpier', { skip: !['ruff', 'csharpier'].every(installed) }, async t => {
+const shellPath = `${process.env.PATH}${path.delimiter}${shims}`;
+const installed = name => spawnSync(name, ['--version'], { env: { ...process.env, PATH: shellPath } }).status === 0;
+// The installed program's path, also behind a mise shim.
+const which = name => {
+  const found = spawnSync('sh', ['-c', `command -v ${name}`], { env: { ...process.env, PATH: shellPath }, encoding: 'utf8' }).stdout.trim();
+  return found && path.basename(fs.realpathSync(found)) === 'mise' ? spawnSync('mise', ['which', name], { encoding: 'utf8' }).stdout.trim() : found;
+};
+
+// Fails when an Oxfmt update renames or reshapes the Markdown chunk in its package, as the Oxc test above does for Oxc.
+test('the installed Oxfmt still has a Markdown parser to find', { skip: !installed('oxfmt') }, async t => {
+  const oxfmtPath = which('oxfmt');
+  const root = repo(t, 'project-formatter-installed-oxfmt-');
+  codeBlockTools(t, root);
+  assert.equal(await format('```py\nx=1\n```\n', path.join(root, 'a.md'), { oxfmtPath }), '```py\nx = 1\n```\n');
+});
+
+// Fails when an update of Oxfmt, Ruff or CSharpier changes its output or how it reports a block it cannot format.
+test('Markdown with the installed Oxfmt, Ruff and CSharpier', { skip: !['oxfmt', 'ruff', 'csharpier'].every(installed) }, async t => {
   const root = repo(t, 'project-formatter-code-blocks-real-');
-  const oxfmt = { oxfmtPath: path.join(root, 'oxfmt') };
-  fs.writeFileSync(oxfmt.oxfmtPath, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', { mode: 0o755 });
+  const oxfmt = { oxfmtPath: which('oxfmt') };
   const log = [];
   const run = input => format(input, path.join(root, 'a.md'), oxfmt, undefined, message => log.push(message));
-  // In a list and a blockquote too, with CRLF as well; a method without its class stays.
+  // In a list and a blockquote too; a method without its class stays.
   assert.equal(await run('```python\ndef f( a ):\n  return a\n```\n\n- C#:\n\n  ```csharp\n  if(x){y();}\n  ```\n\n> ```cs\n> var q=1;\n> ```\n\n```cs\npublic int Add(int a,int b){return a+b;}\n```\n'),
     '```python\ndef f(a):\n    return a\n```\n\n- C#:\n\n  ```csharp\n  if (x)\n  {\n      y();\n  }\n  ```\n\n> ```cs\n> var q = 1;\n> ```\n\n```cs\npublic int Add(int a,int b){return a+b;}\n```\n');
   assert.ok(log.includes('csharpier: the C# blocks at lines 19 are not valid C# on their own and stay as they are.'), log.join('\n'));
-  assert.equal(await run('```cs\r\nvar x=1;\r\n```\r\n'), '```cs\r\nvar x = 1;\r\n```\r\n');
+  // Ruff dedents a docstring with a fence in it; Oxfmt has lengthened the block's own fence, so that line stays code.
+  const docstring = '```python\n"""\n    ```\n    x=1\n"""\n```\n\nOutside prose.\n';
+  assert.equal(await run(docstring), '````python\n"""\n```\nx=1\n"""\n````\n\nOutside prose.\n');
+  // Under `prettier-ignore`, Oxfmt keeps the short fence, and the block stays as it is.
+  assert.equal(await run(`<!-- prettier-ignore -->\n${docstring}`), `<!-- prettier-ignore -->\n${docstring}`);
 });
 
 test('a cancelled tool ends together with the programs it started', async t => {
