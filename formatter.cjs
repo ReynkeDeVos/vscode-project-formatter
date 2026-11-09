@@ -197,7 +197,12 @@ function formatWithPrettier(command, input, file, env, signal) {
       signal?.removeEventListener('abort', onAbort);
       if (error) reject(error); else resolve(formatted);
     };
-    const onMessage = reply => reply.id === id && done(reply.error && new Error(`prettier: ${reply.error}`), reply.formatted);
+    const onMessage = reply => {
+      if (reply.id !== id) return;
+      // How it parsed the file, as the Markdown step needs it: from the config this very format used.
+      command.reported = reply.parser && { parser: reply.parser, plugins: reply.plugins };
+      done(reply.error && new Error(`prettier: ${reply.error}`), reply.formatted);
+    };
     const onExit = code => done(new Error(`prettier: process exited (${code ?? 'killed'}); file kept unchanged.`));
     const onAbort = () => done(signal.reason);
     const timer = setTimeout(() => child.kill(), 15000);
@@ -230,10 +235,10 @@ function execute(executable, args, input, { cwd, env, signal }) {
     let escalation;
     const child = spawn(executable, args, { cwd, env, detached: true });
     const kill = name => { try { process.kill(-child.pid, name); } catch {} }; // Not started, or already ended.
+    // A pending SIGKILL stays when the program ends: what it started may still run in its group.
     const finish = (code, killedBy) => {
       if (!timer) return;
       clearTimeout(timer);
-      clearTimeout(escalation);
       timer = undefined;
       signal?.removeEventListener('abort', abort);
       if (!error && (code || killedBy)) error = Object.assign(new Error(`exited with ${code ?? killedBy}`), { code });
@@ -298,7 +303,8 @@ const codeFence = /(?:`{3,}|~{3,})[ \t]*\{?\.?(?:py|cs\b|csharp|c#)/i;
 async function packageOf(tool, executable, cwd, env, signal) {
   const runnable = file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
   let bin = path.isAbsolute(executable) ? executable
-    : env.PATH.split(path.delimiter).filter(Boolean).map(dir => path.join(dir, executable)).find(runnable);
+    // As spawn: an empty or relative entry counts from the folder the formatter runs in.
+    : env.PATH.split(path.delimiter).map(dir => path.join(path.resolve(cwd, dir), executable)).find(runnable);
   if (bin && path.basename(fs.realpathSync(bin)) === 'mise') bin = (await execute('mise', ['which', tool], '', { cwd, env, signal })).stdout.trim();
   signal?.throwIfAborted();
   if (!bin || !path.isAbsolute(bin) || !runnable(bin)) return;
@@ -336,12 +342,17 @@ async function markdownParser(command, file, env, signal) {
   const root = command.prettier ? path.dirname(command.prettier) : await packageOf('prettier', command.executable, command.cwd, env, signal);
   const module = root && path.join(root, 'plugins', 'markdown.js');
   if (!module || !fs.existsSync(module)) return { reason: "no Markdown parser of Prettier 3 found in prettier's package (Prettier 2 loads plugins by itself)" };
-  // The parser Prettier picks for the file, from a config's overrides too, and its plugins, which can replace any parser.
-  const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'prettier-info.cjs'), root, file], '', { cwd: command.cwd, env, signal });
-  signal?.throwIfAborted();
-  let info = {};
-  try { info = JSON.parse(stdout); } catch {}
-  if (error || !info.parser) return { reason: `prettier says nothing about this file: ${stderr.trim() || error?.message || 'no parser'}` };
+  // The parser Prettier formatted the file with, from a config's overrides too, and its plugins, which can replace any parser.
+  // The kept-loaded Prettier reports them with its result, from the config it used, which may be older than the files on disk;
+  // the CLI starts afresh on every run, and so does prettier-info.cjs.
+  let info = command.reported ?? {};
+  if (!command.prettier) {
+    const { error, stdout, stderr } = await execute('node', [path.join(__dirname, 'prettier-info.cjs'), root, file], '', { cwd: command.cwd, env, signal });
+    signal?.throwIfAborted();
+    try { info = JSON.parse(stdout); } catch {}
+    if (error) info = { error: stderr.trim() || error.message };
+  }
+  if (!info.parser) return { reason: `prettier says nothing about this file${info.error ? `: ${info.error}` : ''}` };
   if (info.plugins.length) return { reason: 'prettier has plugins for this file, which can read Markdown differently' };
   // MDX reads code inside JSX and exports as code blocks, so only Markdown counts.
   return ['markdown', 'remark'].includes(info.parser) ? { module, parser: info.parser } : { reason: `prettier formats this file with the ${info.parser} parser` };

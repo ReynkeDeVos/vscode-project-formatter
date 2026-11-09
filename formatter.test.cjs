@@ -646,6 +646,16 @@ test('Prettier: only a file it prints as Markdown, as its config, pragmas and ig
   config('.prettierrc', '{}');
   config('.prettierignore', 'a.md\n');
   assert.equal(await run(block), block);
+  // A config that imports another file: the kept-loaded Prettier keeps what it read until its own config files change, and the
+  // blocks follow what it formatted with, not the newer file on disk.
+  fs.rmSync(path.join(root, '.prettierignore'));
+  fs.rmSync(path.join(root, '.prettierrc'));
+  fs.writeFileSync(path.join(root, 'options.cjs'), "module.exports = { parser: 'mdx' };");
+  config('.prettierrc.cjs', "module.exports = require('./options.cjs');");
+  const jsx = '<Lesson text={`\n\n~~~py\nx=1\n~~~\n\n`} />\n';
+  assert.match(await run(jsx), /\nx=1\n/);
+  fs.writeFileSync(path.join(root, 'options.cjs'), 'module.exports = {};');
+  assert.match(await run(jsx), /\nx=1\n/);
 });
 
 test('the parser comes only from the package the formatter runs from', async t => {
@@ -676,6 +686,15 @@ test('the parser comes only from the package the formatter runs from', async t =
   process.env.PATH = [path.join(root, 'shadow', 'bin'), path.join(root, 'real'), PATH].join(path.delimiter);
   assert.equal(await run({}), '```py\nx = 1\n```\n');
   process.env.PATH = PATH;
+  // An empty PATH entry is the folder the formatter runs in, as for spawn: the Oxfmt there runs, not a later one's package.
+  fs.mkdirSync(path.join(root, 'later', 'bin'), { recursive: true });
+  trap(path.join(root, 'later'), '{"name": "oxfmt", "bin": {"oxfmt": "bin/oxfmt"}}');
+  fs.writeFileSync(path.join(root, 'later', 'bin', 'oxfmt'), markdownFormatter, { mode: 0o755 });
+  fs.symlinkSync(own, path.join(root, 'oxfmt'));
+  process.env.PATH = ['', path.join(root, 'later', 'bin'), PATH].join(path.delimiter);
+  assert.equal(await run({}), '```py\nx = 1\n```\n');
+  process.env.PATH = PATH;
+  fs.rmSync(path.join(root, 'oxfmt'));
   // A launcher inside a package named oxfmt that declares another file as its command, like a hard link into an unrelated folder.
   fs.mkdirSync(path.join(root, 'unrelated', 'tools'), { recursive: true });
   trap(path.join(root, 'unrelated'), '{"name": "oxfmt", "bin": {"oxfmt": "tools/other"}}');
@@ -702,6 +721,28 @@ test('the parser comes only from the package the formatter runs from', async t =
   t.after(() => process.chdir(cwd));
   assert.equal(await run({ oxfmtPath: lone }), '```py\nx=1\n```\n');
   assert.equal(fs.existsSync(loaded), false);
+});
+
+test('a program a tool started that ignores SIGTERM ends too, after the tool itself has', async t => {
+  const root = repo(t, 'project-formatter-sigterm-child-');
+  const pids = path.join(root, 'pids');
+  // A launcher that ends on SIGTERM, and its child, in the same group, which ignores it.
+  const tool = path.join(root, 'tool');
+  fs.writeFileSync(tool, `#!/usr/bin/env node
+const child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(pids).replaceAll('"', '\\"')}, String(process.pid)); setInterval(() => {}, 1000);"], { stdio: 'ignore' });
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(root, '.oxfmtrc.json'), '{}');
+  const abort = new AbortController();
+  const formatting = format('x\n', path.join(root, 'a.ts'), { oxfmtPath: tool }, abort.signal);
+  const wait = () => new Promise(resolve => setTimeout(resolve, 10));
+  while (!(fs.existsSync(pids) && fs.readFileSync(pids, 'utf8'))) await wait();
+  abort.abort();
+  await assert.rejects(formatting, /aborted/);
+  const alive = pid => { try { return process.kill(pid, 0); } catch { return false; } };
+  const pid = Number(fs.readFileSync(pids, 'utf8'));
+  for (let tries = 0; alive(pid) && tries < 500; tries++) await wait();
+  assert.equal(alive(pid), false);
 });
 
 test('a tool that ignores SIGTERM still ends with a cancelled save', async t => {
