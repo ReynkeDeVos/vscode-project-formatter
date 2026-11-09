@@ -20,12 +20,13 @@ exports.activate = context => {
         const cancellation = token.onCancellationRequested(() => abort.abort());
         try {
           const input = document.getText();
-          const settings = vscode.workspace.getConfiguration('oxc', document.uri);
           const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
           const languages = vscode.extensions.all.flatMap(extension => extension.packageJSON.contributes?.languages ?? []);
           const file = documentPath(document, root, languages, rules.extensions);
           // By the path, because notebook cells and untitled documents have addresses no workspace folder matches.
-          const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file))?.uri.fsPath;
+          const fileUri = vscode.Uri.file(file);
+          const folder = vscode.workspace.getWorkspaceFolder(fileUri)?.uri.fsPath;
+          const settings = vscode.workspace.getConfiguration('oxc', fileUri);
           const formatted = await format(input, file, {
             oxfmtPath: oxcPath(settings.get('path.oxfmt'), root),
             nodePath: oxcPath(settings.get('path.node'), root),
